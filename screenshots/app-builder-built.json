@@ -1,0 +1,38 @@
+{
+  "url": "http://127.0.0.1:8081/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "Clampwright",
+      "hasCanvas": true,
+      "bodyTextLen": 151,
+      "bodyTextHash": "231da9b6dd7e39730809d466915cc4e009658be2aea514f251c9064dd93d97c6",
+      "bodyTextPrefix": "CLAMPWRIGHT Frame Free build Build Cuts Select Post Rail Lumber ",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-built.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "Clampwright",
+      "hasCanvas": true,
+      "bodyTextLen": 151,
+      "bodyTextHash": "231da9b6dd7e39730809d466915cc4e009658be2aea514f251c9064dd93d97c6",
+      "bodyTextPrefix": "CLAMPWRIGHT Frame Free build Build Cuts Select Post Rail Lumber ",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-built-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-built.json",
+  "divergesFromBaseline": false,
+  "baselineReasons": []
+}
