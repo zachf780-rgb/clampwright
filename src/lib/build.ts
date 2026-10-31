@@ -250,6 +250,8 @@ export type Fitting = {
   extraHalfShims?: number;
   /** 1"-to-3/4" shims when a 1" clamp grabs a smaller pipe. */
   extraOneShims?: number;
+  /** Through-pipe direction. Omitted means the post, straight up. */
+  axis?: Vec3;
 };
 
 export type Issue = { severity: "warn" | "info"; text: string };
@@ -1176,6 +1178,7 @@ function buildSketch(project: FullProject): Build {
       id: `fit:${node.id}:${Math.round(y * 32)}`,
       sku,
       position: [node.x, y, node.z],
+      axis: throughAxis(node, byId, project.links),
       branches: dirs.map((dir) => {
         const spec = armSpec(jointFamily, dirs, dir);
         return { dir: DIR_VEC[dir], setback: spec.setback, outer: spec.outer, inner: spec.inner };
@@ -1223,18 +1226,19 @@ function buildSketch(project: FullProject): Build {
       const skuB = Math.abs(angB - 45) <= 3 ? "45" : "hinge";
       specA.seat = skuA === "45" ? "45°" : "hinge";
       specB.seat = skuB === "45" ? "45°" : "hinge";
-      const pushAngle = (end: "a" | "b", sku: "45" | "hinge", at: Vec3, aim: Vec3) => {
+      const pushAngle = (end: "a" | "b", sku: "45" | "hinge", at: Vec3, aim: Vec3, axis: Vec3) => {
         fittings.push({
           id: `hinge:${link.id}:${end}`,
           sku,
           position: at,
+          axis,
           branches: [{ dir: aim, setback: linkFam.braceSetback, outer: linkFam.T.outer, inner: linkFam.T.inner }],
           purchasable: true,
           approx: sku !== "45",
         });
       };
-      pushAngle("a", skuA, [a.x, ya, a.z], dir);
-      pushAngle("b", skuB, [b.x, yb, b.z], scale(dir, -1));
+      pushAngle("a", skuA, [a.x, ya, a.z], dir, throughAxis(a, byId, project.links));
+      pushAngle("b", skuB, [b.x, yb, b.z], scale(dir, -1), throughAxis(b, byId, project.links));
       if (!diagonalNoted) {
         diagonalNoted = true;
         issues.push({
@@ -1254,6 +1258,7 @@ function buildSketch(project: FullProject): Build {
           id: `hinge:${link.id}:${end}`,
           sku: "hinge",
           position: [node.x, ny, node.z],
+          axis: throughAxis(node, byId, project.links),
           branches: [{ dir, setback: linkFam.braceSetback, outer: linkFam.T.outer, inner: linkFam.T.inner }],
           purchasable: true,
           approx: true,

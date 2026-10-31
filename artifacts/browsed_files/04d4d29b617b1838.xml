@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <!-- This is the parent sitemap linking to additional sitemaps for products, collections and pages as shown below. The sitemap can not be edited manually, but is kept up to date in real time. -->
+  <sitemap>
+    <loc>https://makerpipe.com/sitemap_agentic_discovery.xml</loc>
+  </sitemap>
+  <sitemap>
+    <loc>https://makerpipe.com/sitemap_products_1.xml?from=724347846699&amp;to=10324685685010</loc>
+  </sitemap>
+  <sitemap>
+    <loc>https://makerpipe.com/sitemap_pages_1.xml?from=24998838315&amp;to=150324150546</loc>
+  </sitemap>
+  <sitemap>
+    <loc>https://makerpipe.com/sitemap_collections_1.xml?from=36166795307&amp;to=262297485385</loc>
+  </sitemap>
+  <sitemap>
+    <loc>https://makerpipe.com/sitemap_blogs_1.xml</loc>
+  </sitemap>
+  <sitemap>
+    <loc>https://makerpipe.com/sitemap_articles_1.xml</loc>
+  </sitemap>
+</sitemapindex>

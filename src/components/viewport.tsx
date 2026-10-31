@@ -175,24 +175,49 @@ function Tube({
   );
 }
 
-function Sleeve({ branch, radius, color }: { branch: Branch; radius: number; color: string }) {
-  const inner = 0.12;
-  const outer = branch.setback + 0.55;
-  const length = outer - inner;
-  const mid = inner + length / 2;
-  const pose = useMemo(() => {
-    const dir = new THREE.Vector3(...branch.dir).normalize();
-    const quaternion = new THREE.Quaternion().setFromUnitVectors(UP, dir);
-    const position = dir.multiplyScalar(mid);
-    return { quaternion, position };
-  }, [branch.dir, branch.setback, mid]);
-  if (length < 0.08) return null;
-  return (
-    <mesh position={pose.position} quaternion={pose.quaternion}>
-      <cylinderGeometry args={[radius, radius, length, 14]} />
-      <meshStandardMaterial color={color} metalness={0.7} roughness={0.4} />
-    </mesh>
-  );
+function quatFrom(dir: Vec3) {
+  const v = new THREE.Vector3(dir[0], dir[1], dir[2]);
+  if (v.lengthSq() < 1e-8) v.set(0, 1, 0);
+  return new THREE.Quaternion().setFromUnitVectors(UP, v.normalize());
+}
+
+function along(dir: Vec3, distance: number): [number, number, number] {
+  const len = Math.hypot(dir[0], dir[1], dir[2]) || 1;
+  return [(dir[0] / len) * distance, (dir[1] / len) * distance, (dir[2] / len) * distance];
+}
+
+function sideOf(through: Vec3, branch: Vec3): Vec3 {
+  const a = new THREE.Vector3(...through);
+  const b = new THREE.Vector3(...branch);
+  if (a.lengthSq() < 1e-8) a.set(0, 1, 0);
+  const side = new THREE.Vector3().crossVectors(a, b);
+  if (side.lengthSq() < 1e-6) side.crossVectors(a.normalize(), new THREE.Vector3(1, 0, 0));
+  if (side.lengthSq() < 1e-6) side.set(0, 0, 1);
+  side.normalize();
+  if (side.y < 0) side.negate();
+  return [side.x, side.y, side.z];
+}
+
+function throughVec(fitting: Fitting): Vec3 {
+  const axis = fitting.axis;
+  if (axis && Math.hypot(axis[0], axis[1], axis[2]) > 1e-6) {
+    const len = Math.hypot(axis[0], axis[1], axis[2]);
+    return [axis[0] / len, axis[1] / len, axis[2] / len];
+  }
+  return [0, 1, 0];
+}
+
+function crossAxes(branches: Branch[]): Vec3[] {
+  const axes: Vec3[] = [];
+  for (const branch of branches) {
+    const len = Math.hypot(branch.dir[0], branch.dir[1], branch.dir[2]);
+    if (len < 1e-6) continue;
+    const u: Vec3 = [branch.dir[0] / len, branch.dir[1] / len, branch.dir[2] / len];
+    if (axes.some((a) => Math.abs(a[0] * u[0] + a[1] * u[1] + a[2] * u[2]) > 0.92)) continue;
+    axes.push(u);
+    if (axes.length === 2) break;
+  }
+  return axes.length ? axes : [[0, 1, 0]];
 }
 
 function ClampMat({ color, glow, purchasable }: { color: string; glow: boolean; purchasable: boolean; present?: boolean; black?: boolean }) {
@@ -201,11 +226,63 @@ function ClampMat({ color, glow, purchasable }: { color: string; glow: boolean; 
       color={color}
       emissive={glow ? "#e2a322" : "#000000"}
       emissiveIntensity={glow ? 0.85 : 0}
-      metalness={0.68}
-      roughness={0.4}
+      metalness={0.8}
+      roughness={0.34}
       transparent={!purchasable}
       opacity={purchasable ? 1 : 0.32}
     />
+  );
+}
+
+type ClampLook = { color: string; glow: boolean; purchasable: boolean };
+
+function Band({ axis, radius, length, look }: { axis: Vec3; radius: number; length: number; look: ClampLook }) {
+  if (length < 0.08) return null;
+  return (
+    <mesh quaternion={quatFrom(axis)} castShadow>
+      <cylinderGeometry args={[radius, radius, length, 20]} />
+      <ClampMat {...look} />
+    </mesh>
+  );
+}
+
+function Saddle({
+  branch,
+  through,
+  radius,
+  collar,
+  bolt,
+  look,
+}: {
+  branch: Branch;
+  through: Vec3;
+  radius: number;
+  collar: number;
+  bolt: string;
+  look: ClampLook;
+}) {
+  const start = Math.max(0.28, collar - 0.04);
+  const end = Math.max(start + 0.62, branch.setback + 0.22);
+  const length = end - start;
+  const mid = (start + end) / 2;
+  const side = sideOf(through, branch.dir);
+  const at = along(branch.dir, mid);
+  const boltAt: [number, number, number] = [at[0] + side[0] * (radius + 0.02), at[1] + side[1] * (radius + 0.02), at[2] + side[2] * (radius + 0.02)];
+  return (
+    <group>
+      <mesh position={at} quaternion={quatFrom(branch.dir)} castShadow>
+        <cylinderGeometry args={[radius, radius, length, 18]} />
+        <ClampMat {...look} />
+      </mesh>
+      <mesh position={along(branch.dir, end - 0.04)} quaternion={quatFrom(branch.dir)} castShadow>
+        <cylinderGeometry args={[radius + 0.045, radius + 0.01, 0.08, 18]} />
+        <ClampMat {...look} />
+      </mesh>
+      <mesh position={boltAt} quaternion={quatFrom(side)} castShadow>
+        <cylinderGeometry args={[0.1, 0.1, 0.14, 6]} />
+        <meshStandardMaterial color={bolt} metalness={0.9} roughness={0.28} />
+      </mesh>
+    </group>
   );
 }
 
@@ -216,7 +293,6 @@ function FittingMesh({
   selected,
   glow,
   present,
-  black,
   onPick,
 }: {
   fitting: Fitting;
@@ -230,7 +306,7 @@ function FittingMesh({
 }) {
   const color = selected ? colors.hot : glow ? "#f0d48a" : colors.fitting;
   const r = od / 2;
-  const mat = { color, glow, purchasable: fitting.purchasable, present, black };
+  const mat = { color, glow, purchasable: fitting.purchasable };
   if (fitting.sku === "flange") {
     return (
       <group position={fitting.position} onClick={(e) => { e.stopPropagation(); onPick(); }}>
@@ -251,6 +327,17 @@ function FittingMesh({
       </group>
     );
   }
+  const through = throughVec(fitting);
+  const angled = fitting.sku === "45" || fitting.sku === "hinge";
+  const collarR = angled ? r + 0.14 : r + 0.2;
+  const socket = r + 0.16;
+  const collarH =
+    fitting.sku === "hinge" ? Math.max(0.68, socket * 1.2)
+    : fitting.sku === "45" ? Math.max(0.74, socket * 1.25)
+    : fitting.sku === "T" ? Math.max(0.92, socket * 1.6)
+    : fitting.sku === "4way" || fitting.sku === "5way" ? Math.max(1.2, socket * 2.05)
+    : Math.max(1.06, socket * 1.85);
+  const branch = fitting.branches[0];
   return (
     <group position={fitting.position} onClick={(e) => { e.stopPropagation(); onPick(); }}>
       {glow ? (
@@ -259,16 +346,73 @@ function FittingMesh({
           <meshBasicMaterial color="#e2a322" transparent opacity={0.28} depthWrite={false} />
         </mesh>
       ) : null}
-      <mesh castShadow receiveShadow={Boolean(present)}>
-        <cylinderGeometry args={[r + 0.1, r + 0.1, fitting.sku === "5way" || fitting.sku === "4way" ? 1.7 : 1.4, 16]} />
-        <ClampMat {...mat} />
+      {fitting.sku === "cross" ? (
+        crossAxes(fitting.branches).map((axis, i) => (
+          <Band key={i} axis={axis} radius={r + 0.18} length={Math.max(1.15, od + 0.35)} look={mat} />
+        ))
+      ) : fitting.sku === "hinge" && branch ? (
+        <Hinge through={through} branch={branch} collarR={collarR} collarH={collarH} socket={socket} bolt={colors.bolt} look={mat} />
+      ) : (
+        <>
+          <Band axis={through} radius={collarR} length={collarH} look={mat} />
+          {fitting.branches.map((item, i) => (
+            <Saddle key={i} branch={item} through={through} radius={socket} collar={collarR} bolt={colors.bolt} look={mat} />
+          ))}
+        </>
+      )}
+    </group>
+  );
+}
+
+function Hinge({
+  through,
+  branch,
+  collarR,
+  collarH,
+  socket,
+  bolt,
+  look,
+}: {
+  through: Vec3;
+  branch: Branch;
+  collarR: number;
+  collarH: number;
+  socket: number;
+  bolt: string;
+  look: ClampLook;
+}) {
+  const side = sideOf(through, branch.dir);
+  const pivot = Math.max(collarR + 0.16, 0.7);
+  const cupStart = pivot + 0.22;
+  const cupEnd = Math.max(cupStart + 0.7, branch.setback + 0.2);
+  const cupMid = (cupStart + cupEnd) / 2;
+  const cupAt = along(branch.dir, cupMid);
+  return (
+    <group>
+      <Band axis={through} radius={collarR} length={collarH} look={look} />
+      <mesh position={along(branch.dir, pivot)} quaternion={quatFrom(side)} castShadow>
+        <cylinderGeometry args={[0.2, 0.2, 0.42, 12]} />
+        <ClampMat {...look} />
       </mesh>
-      {fitting.branches.map((branch, i) => (
-        <Sleeve key={i} branch={branch} radius={r + 0.12} color={present && !glow ? (black ? "#2c302e" : "#b7beb8") : color} />
-      ))}
-      <mesh position={[r + 0.16, 0, 0]} rotation={[0, 0, Math.PI / 2]} castShadow>
-        <cylinderGeometry args={[0.13, 0.13, 0.22, 6]} />
-        <meshStandardMaterial color={colors.bolt} metalness={0.85} roughness={0.28} />
+      <mesh position={along(branch.dir, pivot)} quaternion={quatFrom(side)} castShadow>
+        <cylinderGeometry args={[0.09, 0.09, 0.56, 8]} />
+        <meshStandardMaterial color={bolt} metalness={0.9} roughness={0.28} />
+      </mesh>
+      <mesh position={cupAt} quaternion={quatFrom(branch.dir)} castShadow>
+        <cylinderGeometry args={[socket, socket, cupEnd - cupStart, 18]} />
+        <ClampMat {...look} />
+      </mesh>
+      <mesh position={along(branch.dir, cupEnd - 0.04)} quaternion={quatFrom(branch.dir)} castShadow>
+        <cylinderGeometry args={[socket + 0.045, socket + 0.01, 0.08, 18]} />
+        <ClampMat {...look} />
+      </mesh>
+      <mesh
+        position={[cupAt[0] + side[0] * (socket + 0.02), cupAt[1] + side[1] * (socket + 0.02), cupAt[2] + side[2] * (socket + 0.02)]}
+        quaternion={quatFrom(side)}
+        castShadow
+      >
+        <cylinderGeometry args={[0.09, 0.09, 0.12, 6]} />
+        <meshStandardMaterial color={bolt} metalness={0.9} roughness={0.28} />
       </mesh>
     </group>
   );
@@ -1047,8 +1191,8 @@ export function Viewport({
   const trade = tradeById(project.trade);
   const colors =
     project.finish === "black"
-      ? { pipe: "#3a3e3b", fitting: "#232624", bolt: "#d5d8dc", hot: "#e2a322", hint: "#f0d48a" }
-      : { pipe: "#c9cdc6", fitting: "#9aa199", bolt: "#2c2e2c", hot: "#e2a322", hint: "#f0d48a" };
+      ? { pipe: "#3a3e3b", fitting: "#4e534f", bolt: "#d5d8dc", hot: "#e2a322", hint: "#f0d48a" }
+      : { pipe: "#c9cdc6", fitting: "#d7dbd6", bolt: "#2c2e2c", hot: "#e2a322", hint: "#f0d48a" };
   const nodes = project.mode === "sketch" ? (project.nodes ?? []) : [];
   const focus: Vec3 =
     project.mode === "sketch"
