@@ -15,6 +15,7 @@ import {
 } from "./catalog";
 import { formatDecimal, formatLen, money, parseLength } from "./format";
 import { cleanBoards, lumberSlideSelfCheck, type Board } from "./lumber";
+import { loadSelfCheck, type ShopLoad } from "./load";
 
 export type { Finish, TradeId };
 
@@ -50,6 +51,8 @@ export type Project = {
   straps?: Strap[];
   /** Boards and panels screwed to clamps or to other lumber. */
   boards?: Board[];
+  /** Weights and sideways shoves for the load test. They do not change a cut. */
+  loads?: ShopLoad[];
   /** Ground in the finished view. Editing still uses the grid. */
   floor?: FloorKind;
 };
@@ -115,6 +118,7 @@ export type FullProject = Project & {
   references: MeasureRef[];
   straps: Strap[];
   boards: Board[];
+  loads: ShopLoad[];
 };
 
 function cleanStraps(raw: Strap[] | undefined): Strap[] {
@@ -152,6 +156,7 @@ export function normalizeProject(project: Project): FullProject {
     references: Array.isArray(project.references) ? project.references : [],
     straps: cleanStraps(project.straps),
     boards,
+    loads: [],
     braces: false,
     stick: project.stick === 96 || project.stick === 240 ? project.stick : 120,
     links: seated.links,
@@ -3147,6 +3152,7 @@ export function previewRailRun(project: Project, stops: { nodeId: string; y: num
 
 export function selfCheck(): void {
   lumberSlideSelfCheck();
+  loadSelfCheck();
   const base: Project = {
     id: "t",
     name: "check",

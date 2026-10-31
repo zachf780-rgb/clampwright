@@ -667,6 +667,252 @@ h3 {
   max-width: min(36rem, calc(100% - 1.5rem));
 }
 
+.dim-tag.on {
+  box-shadow: 0 0 0 2px #141614, 0 0 0 4px #f4e7c3;
+}
+
+.view.tool-load .scene {
+  cursor: crosshair;
+}
+
+.workspace.load-mode .drawer,
+.workspace.load-mode .toolbelt,
+.workspace.load-mode .canvas-side,
+.workspace.load-mode .pick-hint {
+  display: none;
+}
+
+.workspace.load-mode .hud {
+  left: auto;
+  right: 0.75rem;
+}
+
+.load-hint {
+  position: absolute;
+  z-index: 5;
+  top: 0.45rem;
+  left: 50%;
+  transform: translateX(-50%);
+  margin: 0;
+  padding: 0.3rem 0.65rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, #101311 82%, transparent);
+  color: #f0d48a;
+  font-size: 0.82rem;
+  pointer-events: none;
+  text-align: center;
+  max-width: min(28rem, calc(100% - 24rem));
+}
+
+.load-panel {
+  position: absolute;
+  z-index: 5;
+  top: 0.5rem;
+  left: 0.5rem;
+  bottom: 0.5rem;
+  width: min(22rem, calc(100% - 1rem));
+  overflow: auto;
+  background: color-mix(in srgb, var(--color-surface) 96%, transparent);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius);
+  box-shadow: 0 16px 40px rgb(0 0 0 / 35%);
+  padding: 0.75rem 0.8rem 1.4rem;
+}
+
+.load-panel .seg {
+  display: flex;
+  width: 100%;
+  margin-top: 0.55rem;
+}
+
+.load-panel .seg button {
+  flex: 1;
+  min-height: 40px;
+}
+
+.file-note {
+  position: absolute;
+  z-index: 6;
+  top: 0.45rem;
+  left: 50%;
+  transform: translateX(-50%);
+  margin: 0;
+  padding: 0.35rem 0.65rem;
+  border-radius: 999px;
+  background: #3a2420;
+  color: #f3d5cb;
+  font-size: 0.82rem;
+  pointer-events: none;
+}
+
+.load-legend {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.28rem 0.7rem;
+  margin: 0.35rem 0 0.15rem;
+  padding: 0;
+  list-style: none;
+}
+
+.load-legend li {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.82rem;
+  min-height: 1.35rem;
+}
+
+.load-swatch {
+  width: 0.85rem;
+  height: 0.85rem;
+  border-radius: 2px;
+  flex: none;
+}
+
+.load-verdict {
+  margin: 0.75rem 0 0.35rem;
+  padding: 0.6rem 0.7rem;
+  border-radius: 0.45rem;
+  background: var(--color-bg);
+  border-left: 3px solid #7d9a72;
+}
+
+.load-verdict.soft {
+  border-left-color: #e2a322;
+}
+
+.load-verdict.bad {
+  border-left-color: #d4533c;
+}
+
+.load-verdict strong {
+  display: block;
+  margin-bottom: 0.3rem;
+}
+
+.load-verdict p {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 0.82rem;
+}
+
+.load-list {
+  list-style: none;
+  margin: 0.65rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.load-list li {
+  border: 1px solid var(--color-line);
+  border-radius: 0.5rem;
+  padding: 0.4rem 0.55rem 0.55rem;
+  background: var(--color-bg);
+}
+
+.load-list li.on {
+  border-color: var(--color-accent);
+}
+
+.load-list li.tone-bad {
+  box-shadow: inset 3px 0 0 #d4533c;
+}
+
+.load-list li.tone-soft {
+  box-shadow: inset 3px 0 0 #e2a322;
+}
+
+.load-list li.tone-ok {
+  box-shadow: inset 3px 0 0 #7d9a72;
+}
+
+.load-pick {
+  display: flex;
+  width: 100%;
+  justify-content: space-between;
+  gap: 0.45rem;
+  align-items: baseline;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  text-align: left;
+  padding: 0.2rem 0;
+  min-height: 44px;
+}
+
+.load-pick strong {
+  font-size: 0.92rem;
+}
+
+.load-pick span {
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.load-presets,
+.load-nudge {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin: 0.35rem 0;
+}
+
+.load-presets button,
+.load-nudge button,
+.load-dirs button {
+  min-height: 36px;
+  padding: 0 0.55rem;
+  border-radius: 999px;
+  border: 1px solid var(--color-line);
+  background: var(--color-surface-2);
+  color: var(--color-fg);
+}
+
+.load-presets button.on,
+.load-dirs button.on {
+  background: var(--color-accent);
+  color: var(--color-accent-ink);
+  border-color: var(--color-accent);
+}
+
+.load-dirs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.3rem;
+  margin: 0.35rem 0 0.15rem;
+}
+
+.load-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  margin-top: 0.2rem;
+}
+
+@media (max-width: 800px) {
+  .load-panel {
+    top: auto;
+    left: 0.35rem;
+    right: 0.35rem;
+    bottom: 0.35rem;
+    width: auto;
+    max-height: 46vh;
+  }
+
+  .workspace.load-mode .hud {
+    left: 0.75rem;
+    right: auto;
+  }
+
+  .load-hint {
+    display: none;
+  }
+}
+
 .sheet-moves {
   display: flex;
   flex-direction: column;

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Copy,
@@ -17,6 +17,7 @@ import { DesignPacket } from "@/components/packet";
 import { alignmentNotes, baysMatchingOutside, buildProject, colName, endHeights, fortyFiveButtons, MEASURE_REFERENCES, normalizeProject, previewRailRun, railRunError, stickName, strapWindow, withAxisCount, type Fitting, type MeasureRef, type Member, type PlannedClamp, type Project, type SketchLink, type SketchNode, type Strap } from "@/lib/build";
 import { CONNECTORS, STRAP_PACK_PRICE, TRADES, connectorPrice, tradeById } from "@/lib/catalog";
 import { formatDecimal, formatLen, money, parseLength } from "@/lib/format";
+import { WEIGHT_BANDS, rateLoads, rateCapacities, stationAlong, type ForceDir, type ShopLoad } from "@/lib/load";
 import { OSB_THICKNESS, STOCKS, STOCK_MAP, boardHang, boardTitle, canPlaceLumber, layoutBoard, strapPoints, type Board, type SlideAxis } from "@/lib/lumber";
 import { axisAllowed, axisName, MOVE_AXES, movedText, sameTarget, targetFromSelection, totalText, type MoveAxis, type MoveTarget } from "@/lib/move";
 import { useShop, type Tool } from "@/lib/store";
@@ -1548,6 +1549,217 @@ function BoardCard({ board, project, build, unit }: { board: Board; project: Ret
   );
 }
 
+const PUSH_DIRS: { id: ForceDir; label: string }[] = [
+  { id: "+x", label: "→ width" },
+  { id: "-x", label: "← width" },
+  { id: "+z", label: "→ depth" },
+  { id: "-z", label: "← depth" },
+];
+
+function loadPlace(kind: "weight" | "push", pounds: number, dir: ForceDir): string {
+  if (kind === "weight") return `${pounds} lb down`;
+  const way = PUSH_DIRS.find((item) => item.id === dir)?.label ?? "sideways";
+  return `${pounds} lb ${way}`;
+}
+
+function footedMember(project: { mode?: "grid" | "sketch"; flanges: boolean; nodes: SketchNode[] }, member: Member): boolean {
+  if ((member.buried ?? 0) > 0.4) return true;
+  if (member.kind !== "post") return false;
+  if (project.mode !== "sketch") return project.flanges;
+  const id = member.id.startsWith("post:") ? member.id.slice(5) : "";
+  const node = project.nodes.find((item) => item.id === id);
+  return Boolean(node && (node.flange || (node.bury ?? 0) > 0.4));
+}
+
+function stationOnBoard(
+  board: Board,
+  point: [number, number, number],
+  project: { trade: Project["trade"]; boards: Board[] },
+  build: { fittings: Fitting[]; members: Member[]; straps: Strap[] },
+): number {
+  const laid = layoutBoard(board, {
+    fittings: build.fittings.map((item) => ({ id: item.id, sku: item.sku, position: item.position })),
+    members: build.members.map((item) => ({ id: item.id, a: item.a, b: item.b })),
+    boards: project.boards,
+    straps: strapPoints(build.straps, build.members),
+    pipeRadius: tradeById(project.trade).od / 2,
+  });
+  if (!laid || laid.error || laid.length < 1) return 0.5;
+  const along =
+    (point[0] - laid.origin[0]) * laid.long[0] +
+    (point[1] - laid.origin[1]) * laid.long[1] +
+    (point[2] - laid.origin[2]) * laid.long[2];
+  return Math.min(0.92, Math.max(0.08, (along + laid.length / 2) / laid.length));
+}
+
+function drawingFileName(name: string): string {
+  const clean = name.replace(/[^\w\s-]/g, "").trim().replace(/\s+/g, "-").slice(0, 48);
+  return `${clean || "drawing"}.clampwright.json`;
+}
+
+function nearestLoaded(members: Member[], point: [number, number, number]): { id: string; t: number } | null {
+  let best: { id: string; t: number; d: number } | null = null;
+  for (const member of members) {
+    const t = stationAlong(member.a, member.b, point);
+    const at: [number, number, number] = [
+      member.a[0] + (member.b[0] - member.a[0]) * t,
+      member.a[1] + (member.b[1] - member.a[1]) * t,
+      member.a[2] + (member.b[2] - member.a[2]) * t,
+    ];
+    const d = Math.hypot(point[0] - at[0], point[1] - at[1], point[2] - at[2]);
+    if (!best || d < best.d) best = { id: member.id, t, d };
+  }
+  if (!best || best.d > 8) return null;
+  return { id: best.id, t: best.t };
+}
+
+function PoundsField({ pounds, onCommit }: { pounds: number; onCommit: (n: number) => void }) {
+  const [text, setText] = useState<string | null>(null);
+  return (
+    <label className="field">
+      <span>Pounds</span>
+      <input
+        inputMode="numeric"
+        aria-label="Pounds"
+        value={text ?? String(pounds)}
+        onFocus={(event) => event.currentTarget.select()}
+        onChange={(event) => setText(event.target.value)}
+        onBlur={() => {
+          const n = Number(text);
+          setText(null);
+          if (!Number.isFinite(n)) return;
+          onCommit(Math.min(5000, Math.max(1, Math.round(n))));
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") event.currentTarget.blur();
+        }}
+      />
+    </label>
+  );
+}
+
+function LoadPanel({
+  tool,
+  loads,
+  rows,
+  tone,
+  headline,
+  detail,
+  focus,
+  full,
+  bare,
+  onTool,
+  onFocus,
+  onPounds,
+  onDir,
+  onRemove,
+}: {
+  tool: "weight" | "push";
+  loads: ShopLoad[];
+  rows: { id: string; title: string; line: string; tone: "ok" | "soft" | "bad" }[];
+  tone: "ok" | "soft" | "bad";
+  headline: string;
+  detail: string;
+  focus: string | null;
+  full: boolean;
+  bare: boolean;
+  onTool: (tool: "weight" | "push") => void;
+  onFocus: (id: string) => void;
+  onPounds: (id: string, pounds: number) => void;
+  onDir: (id: string, dir: ForceDir) => void;
+  onRemove: (id: string) => void;
+}) {
+  const presets = tool === "weight" ? [25, 50, 100, 200, 400] : [15, 25, 40, 80, 150];
+  return (
+    <aside className="load-panel" data-testid="load-panel">
+      <div className="drawer-head">
+        <h2>Load test</h2>
+      </div>
+      <p className="fine">
+        Color is how much weight that piece can take. On a rail, that is one weight in the middle. On a post, it is standing on it. The same pounds spread along a shelf is easier.
+      </p>
+      <ul className="load-legend">
+        {WEIGHT_BANDS.map((band) => (
+          <li key={band.label}>
+            <span className="load-swatch" style={{ background: band.color }} />
+            {band.label}
+          </li>
+        ))}
+      </ul>
+      <div className="seg" role="group" aria-label="Kind of force">
+        <button type="button" className={tool === "weight" ? "on" : ""} aria-pressed={tool === "weight"} onClick={() => onTool("weight")}>
+          Anvil
+        </button>
+        <button type="button" className={tool === "push" ? "on" : ""} aria-pressed={tool === "push"} onClick={() => onTool("push")}>
+          Push
+        </button>
+      </div>
+      <p className="fine">
+        {bare
+          ? "This floor is empty. Go back, stand up some posts and a rail, then drop a weight on it."
+          : tool === "weight"
+            ? "Click a pipe or a board. The anvil sits there and pushes straight down."
+            : "Click a pipe or a board, then pick which way the shove goes."}
+      </p>
+      {full ? <p className="run-error">Twenty-four forces is the limit. Remove one to add another.</p> : null}
+      <div className={`load-verdict ${tone}`}>
+        <strong>{headline}</strong>
+        <p>{detail}</p>
+      </div>
+      {loads.length ? <p className="fine">A sag under an inch is drawn bigger so you can see the bow. The colors stay the weight ranges above.</p> : null}
+      {loads.length === 0 ? null : (
+        <ul className="load-list">
+          {loads.map((load) => {
+            const row = rows.find((item) => item.id === load.id);
+            const open = focus === load.id;
+            return (
+              <li key={load.id} className={`${open ? "on " : ""}tone-${row?.tone ?? "ok"}`}>
+                <button type="button" className="load-pick" onClick={() => onFocus(load.id)}>
+                  <strong>{row?.title ?? "Piece"}</strong>
+                  <span>{loadPlace(load.kind, load.pounds, load.dir)}</span>
+                </button>
+                <p className="fine">{row?.line}</p>
+                {open ? (
+                  <div className="load-editor">
+                    <PoundsField pounds={load.pounds} onCommit={(pounds) => onPounds(load.id, pounds)} />
+                    <div className="load-nudge">
+                      <button type="button" onClick={() => onPounds(load.id, Math.max(1, load.pounds - 10))}>
+                        −10
+                      </button>
+                      <button type="button" onClick={() => onPounds(load.id, Math.min(5000, load.pounds + 10))}>
+                        +10
+                      </button>
+                    </div>
+                    <div className="load-presets" role="group" aria-label="Pound presets">
+                      {presets.map((pounds) => (
+                        <button key={pounds} type="button" className={load.pounds === pounds ? "on" : ""} onClick={() => onPounds(load.id, pounds)}>
+                          {pounds}
+                        </button>
+                      ))}
+                    </div>
+                    {load.kind === "push" ? (
+                      <div className="load-dirs" role="group" aria-label="Push direction">
+                        {PUSH_DIRS.map((dir) => (
+                          <button key={dir.id} type="button" className={load.dir === dir.id ? "on" : ""} aria-pressed={load.dir === dir.id} onClick={() => onDir(load.id, dir.id)}>
+                            {dir.label}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+                    <button type="button" className="btn" onClick={() => onRemove(load.id)}>
+                      <Trash2 size={16} /> Remove
+                    </button>
+                  </div>
+                ) : null}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </aside>
+  );
+}
+
 export function AppShell() {
   const projects = useShop((s) => s.projects);
   const activeId = useShop((s) => s.activeId);
@@ -1571,6 +1783,16 @@ export function AppShell() {
   const setShowLabels = useShop((s) => s.setShowLabels);
   const showLumber = useShop((s) => s.showLumber);
   const setShowLumber = useShop((s) => s.setShowLumber);
+  const loadMode = useShop((s) => s.loadMode);
+  const loadTool = useShop((s) => s.loadTool);
+  const shopLoads = useShop((s) => s.shopLoads);
+  const setLoadMode = useShop((s) => s.setLoadMode);
+  const setLoadTool = useShop((s) => s.setLoadTool);
+  const addShopLoad = useShop((s) => s.addShopLoad);
+  const setShopLoad = useShop((s) => s.setShopLoad);
+  const removeShopLoad = useShop((s) => s.removeShopLoad);
+  const importDrawing = useShop((s) => s.importDrawing);
+  const [loadFocus, setLoadFocus] = useState<string | null>(null);
   const activate = useShop((s) => s.activate);
   const setTool = useShop((s) => s.setTool);
   const tool = useShop((s) => s.tool);
@@ -1593,6 +1815,9 @@ export function AppShell() {
   const [startReady, setStartReady] = useState(false);
   const [packetOn, setPacketOn] = useState(false);
   const [packetImage, setPacketImage] = useState<string | null>(null);
+  const [savedFlash, setSavedFlash] = useState(false);
+  const [openNote, setOpenNote] = useState<string | null>(null);
+  const drawingFile = useRef<HTMLInputElement>(null);
   const addReference = useShop((s) => s.addReference);
   const undo = useShop((s) => s.undo);
   const redo = useShop((s) => s.redo);
@@ -1638,7 +1863,32 @@ export function AppShell() {
     }));
   }, [project]);
 
-  if (!project || !build) {
+  const report = useMemo(() => {
+    if (!build) return null;
+    return rateLoads({
+      trade: project.trade,
+      members: build.members,
+      boards: project.boards,
+      fittings: build.fittings,
+      loads: shopLoads,
+      pipeRadius: tradeById(project.trade).od / 2,
+      footed: (member) => footedMember(project, member),
+    });
+  }, [project, build, shopLoads]);
+
+  const caps = useMemo(() => {
+    if (!loadMode || !build) return [];
+    return rateCapacities({
+      trade: project.trade,
+      members: build.members,
+      boards: project.boards,
+      fittings: build.fittings,
+      pipeRadius: tradeById(project.trade).od / 2,
+      footed: (member) => footedMember(project, member),
+    });
+  }, [loadMode, project, build]);
+
+  if (!project || !build || !report) {
     return (
       <main className="boot">
         <p className="brand">Clampwright</p>
@@ -1733,6 +1983,61 @@ export function AppShell() {
     update({ levels });
   };
 
+  const dropLoad = (id: string, point?: [number, number, number]) => {
+    if (shopLoads.length >= 24) return;
+    const spot = point ?? build.fittings.find((item) => item.id === id)?.position;
+    if (!spot) return;
+    let target = "";
+    let t = 0.5;
+    const member = build.members.find((item) => item.id === id);
+    if (member) {
+      target = member.id;
+      t = stationAlong(member.a, member.b, spot);
+    } else if (id.startsWith("board:")) {
+      const board = project.boards.find((item) => id === `board:${item.id}`);
+      if (!board) return;
+      target = id;
+      t = stationOnBoard(board, spot, project, build);
+    } else {
+      const near = nearestLoaded(build.members, spot);
+      if (!near) return;
+      target = near.id;
+      t = near.t;
+    }
+    const next = addShopLoad(target, t);
+    if (next) setLoadFocus(next);
+  };
+
+  const saveDrawing = () => {
+    const body = JSON.stringify({ clampwright: 1, project: { ...project, loads: [] } });
+    const blob = new Blob([body], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = drawingFileName(project.name);
+    link.click();
+    URL.revokeObjectURL(url);
+    setSavedFlash(true);
+    window.setTimeout(() => setSavedFlash(false), 1600);
+  };
+
+  const openDrawing = async (file: File | undefined) => {
+    if (!file) return;
+    try {
+      const raw = JSON.parse(await file.text()) as unknown;
+      const ok = importDrawing(raw);
+      setOpenNote(ok ? null : "That file isn't a Clampwright drawing.");
+      if (ok) {
+        setLoadFocus(null);
+        setNonce((n) => n + 1);
+        setBuildOpen(false);
+        setListOpen(false);
+      }
+    } catch {
+      setOpenNote("That file isn't a Clampwright drawing.");
+    }
+  };
+
   return (
     <div className="app">
       <header className="topbar no-print">
@@ -1748,9 +2053,13 @@ export function AppShell() {
         />
         <select
           className="project-select"
-          aria-label="Open a saved frame"
+          aria-label="Drawings on this device"
+          title="Drawings kept on this device"
           value={project.id}
-          onChange={(e) => open(e.target.value)}
+          onChange={(e) => {
+            open(e.target.value);
+            setLoadFocus(null);
+          }}
         >
           {projects.map((p) => (
             <option key={p.id} value={p.id}>
@@ -1765,6 +2074,30 @@ export function AppShell() {
           <button type="button" className="icon-btn" aria-label="Redo" title="Redo" disabled={!canRedo} onClick={redo}>
             <Redo2 size={16} />
           </button>
+          <button type="button" className="btn" data-testid="save-drawing" onClick={saveDrawing}>
+            {savedFlash ? "Saved" : "Save"}
+          </button>
+          <button type="button" className="btn" data-testid="open-drawing" onClick={() => drawingFile.current?.click()}>
+            {openNote ? "Try again" : "Open"}
+          </button>
+          <input
+            ref={drawingFile}
+            type="file"
+            accept=".json,application/json"
+            hidden
+            aria-label="Open a drawing file"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              event.target.value = "";
+              void openDrawing(file);
+            }}
+          />
+          {loadMode ? (
+            <button type="button" className="btn primary" data-testid="load-test" onClick={() => setLoadMode(false)}>
+              Back to build
+            </button>
+          ) : (
+            <>
           <button
             type="button"
             className="btn primary"
@@ -1800,10 +2133,52 @@ export function AppShell() {
           >
             Cuts
           </button>
+          <button
+            type="button"
+            className="btn"
+            data-testid="load-test"
+            onClick={() => {
+              setLoadMode(true);
+              select(null);
+              setBuildOpen(false);
+              setListOpen(false);
+              setRefsOpen(false);
+            }}
+          >
+            Load test
+          </button>
+            </>
+          )}
         </div>
       </header>
 
-      <div className="workspace">
+      <div className={loadMode ? "workspace load-mode" : "workspace"}>
+        {openNote ? <p className="file-note" role="status">{openNote}</p> : null}
+        {loadMode ? (
+          <LoadPanel
+            tool={loadTool}
+            loads={shopLoads}
+            rows={report.rows}
+            tone={report.tone}
+            headline={report.headline}
+            detail={report.detail}
+            focus={loadFocus}
+            full={shopLoads.length >= 24}
+            bare={build.members.length === 0 && project.boards.length === 0}
+            onTool={setLoadTool}
+            onFocus={setLoadFocus}
+            onPounds={(id, pounds) => {
+              const current = shopLoads.find((item) => item.id === id);
+              if (!current || current.pounds === pounds) return;
+              setShopLoad(id, { pounds });
+            }}
+            onDir={(id, dir) => setShopLoad(id, { dir })}
+            onRemove={(id) => {
+              removeShopLoad(id);
+              if (loadFocus === id) setLoadFocus(null);
+            }}
+          />
+        ) : null}
         <aside className={`rail drawer left${buildOpen ? " open" : ""}`}>
           <div className="drawer-head no-print">
             <h2>Build</h2>
@@ -2051,25 +2426,36 @@ export function AppShell() {
           </section>
         </aside>
 
-        <div className={`view no-print${project.mode === "sketch" || tool === "measure" || tool === "lumber" ? ` tool-${tool}` : ""}`}>
+        <div className={`view no-print${loadMode ? " tool-load" : project.mode === "sketch" || tool === "measure" || tool === "lumber" ? ` tool-${tool}` : ""}`}>
           <Viewport
             project={project}
             build={build}
             selected={selectedId}
-            tool={project.mode === "sketch" || tool === "measure" || tool === "lumber" ? tool : "select"}
+            tool={loadMode ? "select" : project.mode === "sketch" || tool === "measure" || tool === "lumber" ? tool : "select"}
             anchor={anchor}
             unit={unit}
             showMeasures={showMeasures}
             showLabels={showLabels}
             showLumber={showLumber}
             measure={measure}
-            onActivate={activate}
+            onActivate={(id, point) => {
+              if (!loadMode) {
+                activate(id, point);
+                return;
+              }
+              dropLoad(id, point);
+            }}
             onPlace={(x, z) => {
+              if (loadMode) return;
               const empty = project.nodes.length === 0;
               placePost(x, z);
               if (empty) setNonce((n) => n + 1);
             }}
             onClear={() => {
+              if (loadMode) {
+                setLoadFocus(null);
+                return;
+              }
               if (tool === "rail" && draft) return;
               select(null);
             }}
@@ -2085,8 +2471,13 @@ export function AppShell() {
             onBeginEdit={beginEdit}
             onEndEdit={endEdit}
             barEdit={barEdit}
-            picking={project.mode === "sketch" && tool === "rail"}
+            picking={project.mode === "sketch" && tool === "rail" && !loadMode}
             viewNonce={nonce}
+            loadMarks={loadMode ? report.marks : []}
+            loadStrains={loadMode ? report.strains : []}
+            loadCaps={loadMode ? caps : []}
+            loadFocus={loadMode ? loadFocus : null}
+            onLoadMark={setLoadFocus}
             draftLine={
               draft
                 ? draft.stops.flatMap((stop) => {
@@ -2167,7 +2558,7 @@ export function AppShell() {
               data-testid="save-packet"
               onClick={savePacket}
             >
-              Save
+              PDF
             </button>
           </div>
           <div className="canvas-side no-print">
@@ -2224,6 +2615,9 @@ export function AppShell() {
               />
             ) : null}
           </div>
+          {loadMode ? (
+            <p className="load-hint">{loadTool === "weight" ? "Click a pipe or board to set an anvil." : "Click a pipe or board to shove it."}</p>
+          ) : null}
           {project.mode === "sketch" && tool === "rail" ? (
             <p className="pick-hint">
               {draft

@@ -8,6 +8,7 @@ import { tradeById } from "@/lib/catalog";
 import { formatLen } from "@/lib/format";
 import { boardLook, canPlaceLumber, layoutBoard, strapPoints, STOCK_MAP, WOOD_SKUS, type Board, type LayoutContext, type SlideAxis } from "@/lib/lumber";
 import { axisAllowed, MOVE_AXES, type MoveAxis, type MoveTarget } from "@/lib/move";
+import type { LoadMark, MemberStrain } from "@/lib/load";
 import { useShop, type Tool } from "@/lib/store";
 
 const UP = new THREE.Vector3(0, 1, 0);
@@ -475,6 +476,78 @@ function StrapRing({
   );
 }
 
+function Bow({ a, b, sag, axis, radius, color }: { a: Vec3; b: Vec3; sag: number; axis: Vec3; radius: number; color: string }) {
+  const parts = 6;
+  const pts: Vec3[] = [];
+  for (let i = 0; i <= parts; i += 1) {
+    const t = i / parts;
+    const drop = Math.sin(Math.PI * t) * sag;
+    pts.push([
+      a[0] + (b[0] - a[0]) * t + axis[0] * drop,
+      a[1] + (b[1] - a[1]) * t + axis[1] * drop,
+      a[2] + (b[2] - a[2]) * t + axis[2] * drop,
+    ]);
+  }
+  return (
+    <group>
+      {pts.slice(1).map((point, index) => (
+        <Tube key={index} a={pts[index]} b={point} radius={radius} color={color} />
+      ))}
+    </group>
+  );
+}
+
+function Anvil({ mark, hot, onPick }: { mark: LoadMark; hot?: boolean; onPick: () => void }) {
+  const tone = mark.tone === "bad" ? "#d4533c" : mark.tone === "soft" ? "#e2a322" : "#6a7076";
+  return (
+    <group position={mark.seat} onClick={(event) => { event.stopPropagation(); onPick(); }}>
+      <mesh position={[0, 0.7, 0]} castShadow>
+        <boxGeometry args={[3.3, 1.35, 1.65]} />
+        <meshStandardMaterial color="#2a2e32" metalness={0.74} roughness={0.38} />
+      </mesh>
+      <mesh position={[1.7, 0.72, 0]} rotation={[0, 0, -0.55]} castShadow>
+        <boxGeometry args={[1.7, 0.42, 0.62]} />
+        <meshStandardMaterial color="#3a3f44" metalness={0.7} roughness={0.42} />
+      </mesh>
+      <mesh position={[-0.15, 1.5, 0]} castShadow>
+        <boxGeometry args={[2.15, 0.32, 1.05]} />
+        <meshStandardMaterial color={tone} metalness={0.55} roughness={0.4} />
+      </mesh>
+      <Html position={[0, 2.5, 0]} center sprite distanceFactor={90} zIndexRange={[30, 0]}>
+        <div className={hot ? "dim-tag on" : "dim-tag"}>{mark.pounds} lb</div>
+      </Html>
+    </group>
+  );
+}
+
+function Shove({ mark, hot, onPick }: { mark: LoadMark; hot?: boolean; onPick: () => void }) {
+  const len = 9 + Math.min(14, mark.pounds / 12);
+  const color = mark.tone === "bad" ? "#d4533c" : mark.tone === "soft" ? "#e2a322" : "#f0d48a";
+  const end: Vec3 = [
+    mark.seat[0] + mark.dir[0] * len,
+    mark.seat[1] + 1.2 + mark.dir[1] * len,
+    mark.seat[2] + mark.dir[2] * len,
+  ];
+  const start: Vec3 = [mark.seat[0], mark.seat[1] + 1.2, mark.seat[2]];
+  const { position, quaternion, length } = orient(start, end);
+  const head = new THREE.Vector3(...end);
+  return (
+    <group onClick={(event) => { event.stopPropagation(); onPick(); }}>
+      <mesh position={position} quaternion={quaternion}>
+        <cylinderGeometry args={[0.28, 0.28, Math.max(0.4, length - 2.2), 10]} />
+        <meshStandardMaterial color={color} emissive={color} emissiveIntensity={0.35} />
+      </mesh>
+      <mesh position={head} quaternion={quaternion}>
+        <coneGeometry args={[0.85, 2.2, 10]} />
+        <meshStandardMaterial color={color} emissive={color} emissiveIntensity={0.35} />
+      </mesh>
+      <Html position={[end[0], end[1] + 1.6, end[2]]} center sprite distanceFactor={90} zIndexRange={[30, 0]}>
+        <div className={hot ? "dim-tag on" : "dim-tag"}>{mark.pounds} lb shove</div>
+      </Html>
+    </group>
+  );
+}
+
 function MemberMesh({
   member,
   radius,
@@ -490,6 +563,10 @@ function MemberMesh({
   onPick,
   onStrap,
   onDragStart,
+  heat = 0,
+  bow = 0,
+  bowAxis = [0, -1, 0],
+  tint,
 }: {
   member: Member;
   radius: number;
@@ -505,8 +582,13 @@ function MemberMesh({
   onPick: (point: Vec3) => void;
   onStrap: (id: string, point: Vec3) => void;
   onDragStart: (kind: "post" | "post-h" | "link", point: Vec3) => void;
+  heat?: number;
+  bow?: number;
+  bowAxis?: Vec3;
+  tint?: string;
 }) {
-  const color = selected ? colors.hot : glow || hinted ? colors.hint : colors.pipe;
+  const base = selected ? colors.hot : glow || hinted ? colors.hint : colors.pipe;
+  const color = tint ?? (heat >= 1 ? "#d4533c" : heat >= 0.7 ? "#e2a322" : base);
   const { position, quaternion, length } = useMemo(() => orient(member.a, member.b), [member.a, member.b]);
   const down = (e: ThreeEvent<PointerEvent>) => {
     if (!dragEnabled) return;
@@ -519,8 +601,9 @@ function MemberMesh({
   return (
     <group onPointerDown={down}>
       {member.segments.map((seg: Segment, i) => (
-        <Tube key={i} a={seg.a} b={seg.b} radius={radius} color={color} glow={glow && !selected} present={present} black={black} onPick={(e) => onPick([e.point.x, e.point.y, e.point.z])} />
+        <Tube key={i} a={seg.a} b={seg.b} radius={radius} color={color} glow={glow && !selected} dim={bow > 0.2} present={present} black={black} onPick={(e) => onPick([e.point.x, e.point.y, e.point.z])} />
       ))}
+      {bow > 0.2 ? <Bow a={member.a} b={member.b} sag={bow} axis={bowAxis} radius={radius} color={color} /> : null}
       {member.couplings.map((seg, i) => (
         <Tube key={`c${i}`} a={seg.a} b={seg.b} radius={radius + 0.14} color={selected ? colors.hot : "#8e948e"} onPick={(e) => onPick([e.point.x, e.point.y, e.point.z])} />
       ))}
@@ -933,6 +1016,7 @@ function BoardMesh({
   ghost,
   present,
   onPick,
+  tint,
 }: {
   board: Board;
   ctx: LayoutContext;
@@ -941,6 +1025,7 @@ function BoardMesh({
   ghost?: boolean;
   present?: boolean;
   onPick: (point: Vec3) => void;
+  tint?: string;
 }) {
   const laid = layoutBoard(board, ctx);
   const pose = useMemo(() => {
@@ -964,7 +1049,7 @@ function BoardMesh({
     >
       <boxGeometry args={[Math.max(0.05, laid.across), Math.max(0.04, laid.rise), Math.max(0.5, laid.length)]} />
       <meshStandardMaterial
-        color={selected && !present ? "#e2a322" : look.color}
+        color={tint ? tint : selected && !present ? "#e2a322" : look.color}
         map={grain}
         emissive={glow || ghost ? "#e2a322" : "#000000"}
         emissiveIntensity={glow ? 0.28 : ghost ? 0.12 : 0}
@@ -1160,6 +1245,11 @@ export function Viewport({
   picking,
   viewNonce,
   draftLine,
+  loadMarks = [],
+  loadStrains = [],
+  onLoadMark,
+  loadFocus = null,
+  loadCaps = [],
 }: {
   project: Project;
   build: Build;
@@ -1186,6 +1276,11 @@ export function Viewport({
   picking: boolean;
   viewNonce: number;
   draftLine?: Vec3[] | null;
+  loadMarks?: LoadMark[];
+  loadStrains?: MemberStrain[];
+  onLoadMark?: (id: string) => void;
+  loadFocus?: string | null;
+  loadCaps?: { id: string; color: string }[];
 }) {
   const present = false;
   const trade = tradeById(project.trade);
@@ -1318,7 +1413,9 @@ export function Viewport({
           beginDrag.current = start;
         }}
       />
-      {build.members.map((member) => (
+      {build.members.map((member) => {
+        const strain = loadStrains.find((item) => item.id === member.id);
+        return (
         <MemberMesh
           key={member.id}
           member={member}
@@ -1332,6 +1429,10 @@ export function Viewport({
           strapGlow={!present && tool === "lumber"}
           present={present}
           black={project.finish === "black"}
+          heat={strain?.util ?? 0}
+          bow={strain?.bow ?? 0}
+          bowAxis={strain?.axis}
+          tint={loadCaps.find((item) => item.id === member.id)?.color}
           onPick={(point) => {
             if (dragged.current) return;
             if (tool === "measure") onMeasure(point);
@@ -1387,7 +1488,8 @@ export function Viewport({
             });
           }}
         />
-      ))}
+        );
+      })}
       <Measures members={build.members} show={showMeasures} unit={unit} />
       {!present ? <NameTags project={project} build={build} show={showLabels} /> : null}
       {!present ? <LeanArrows /> : null}
@@ -1406,6 +1508,7 @@ export function Viewport({
           selected={!present && selected === `board:${board.id}`}
           glow={!present && tool === "lumber"}
           present={present}
+          tint={loadCaps.find((item) => item.id === `board:${board.id}`)?.color}
           onPick={(point) => onActivate(`board:${board.id}`, point)}
         />
       ))}
@@ -1459,6 +1562,13 @@ export function Viewport({
         <ReferenceBox key={item.id} item={item} selected={selected === `ref:${item.id}`} onPick={() => onActivate(`ref:${item.id}`)} />
       ))}
       {!present ? <MoveGizmo project={project} /> : null}
+      {loadMarks.map((mark) =>
+        mark.kind === "weight" ? (
+          <Anvil key={mark.id} mark={mark} hot={mark.id === loadFocus} onPick={() => onLoadMark?.(mark.id)} />
+        ) : (
+          <Shove key={mark.id} mark={mark} hot={mark.id === loadFocus} onPick={() => onLoadMark?.(mark.id)} />
+        ),
+      )}
       <FitView focus={focus} distance={distance} nonce={viewNonce} />
       <OrbitControls makeDefault enableDamping dampingFactor={0.12} maxPolarAngle={Math.PI / 2.05} />
     </Canvas>

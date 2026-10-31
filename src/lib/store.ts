@@ -3,6 +3,7 @@ import { persist } from "zustand/middleware";
 import { endHeights, explodeGrid, fortyFiveLayout, hostOffsetT, moveClamp, normalizeProject, nudgeFortyFive, railRunError, snapSketch, buildProject, type FortyDir, type FullProject, type MeasureRef, type Project, type SketchLink, type SketchNode, type TradeId } from "./build";
 import { tradeById } from "./catalog";
 import { canPlaceLumber, clampAnchor, layoutBoard, nudgeBoardSlide, pruneBoards, sheetCoverWidth, strapPoints, STOCK_MAP, WOOD_SKUS, type Board, type BoardAnchor, type BoardFace, type BoardRun, type LayoutContext, type SlideAxis, type StockId } from "./lumber";
+import type { ShopLoad } from "./load";
 import { addAxis, projectWithDelta, type MoveAxis, type MoveDelta, type MoveTarget } from "./move";
 
 const base = {
@@ -120,6 +121,14 @@ function uid(): string {
   return crypto.randomUUID();
 }
 
+function drawingBody(raw: unknown): Project | null {
+  if (!raw || typeof raw !== "object") return null;
+  const wrapped = raw as { project?: unknown };
+  const body = wrapped.project && typeof wrapped.project === "object" ? (wrapped.project as Partial<Project>) : (raw as Partial<Project>);
+  if (body.trade !== "half" && body.trade !== "three-quarter" && body.trade !== "one") return null;
+  return body as Project;
+}
+
 function rSign(sign: 1 | -1, inches: number): number {
   return sign * Math.abs(inches);
 }
@@ -228,6 +237,10 @@ type State = {
   showMeasures: boolean;
   showLabels: boolean;
   showLumber: boolean;
+  /** Load-test screen. Weights are not saved with the drawing. */
+  loadMode: boolean;
+  loadTool: "weight" | "push";
+  shopLoads: ShopLoad[];
   /** Why the last sheet slide was refused, if it was. */
   slideNote: string | null;
   update: (patch: Partial<Project>) => void;
@@ -238,6 +251,12 @@ type State = {
   setShowMeasures: (show: boolean) => void;
   setShowLabels: (show: boolean) => void;
   setShowLumber: (show: boolean) => void;
+  setLoadMode: (on: boolean) => void;
+  setLoadTool: (tool: "weight" | "push") => void;
+  addShopLoad: (target: string, t: number) => string;
+  setShopLoad: (id: string, patch: Partial<Pick<ShopLoad, "pounds" | "dir">>) => void;
+  removeShopLoad: (id: string) => void;
+  importDrawing: (raw: unknown) => boolean;
   setRunHeight: (y: number) => void;
   setStopHeight: (nodeId: string, y: number) => void;
   popStop: () => void;
@@ -379,6 +398,9 @@ export const useShop = create<State>()(
       showMeasures: true,
       showLabels: true,
       showLumber: true,
+      loadMode: false,
+      loadTool: "weight",
+      shopLoads: [],
       slideNote: null,
       canUndo: false,
       canRedo: false,
@@ -405,6 +427,40 @@ export const useShop = create<State>()(
       setShowMeasures: (showMeasures) => set({ showMeasures }),
       setShowLabels: (showLabels) => set({ showLabels }),
       setShowLumber: (showLumber) => set({ showLumber }),
+      setLoadMode: (loadMode) =>
+        set({
+          loadMode,
+          anchor: null,
+          draft: null,
+          move: null,
+          shopLoads: loadMode ? get().shopLoads : [],
+        }),
+      setLoadTool: (loadTool) => set({ loadTool }),
+      addShopLoad: (target, t) => {
+        const loads = get().shopLoads;
+        if (loads.length >= 24) return "";
+        const kind = get().loadTool;
+        const load: ShopLoad = {
+          id: uid(),
+          kind,
+          target,
+          t: Math.min(0.92, Math.max(0.08, t)),
+          pounds: kind === "weight" ? 50 : 25,
+          dir: "+x",
+        };
+        set({ shopLoads: [...loads, load] });
+        return load.id;
+      },
+      setShopLoad: (id, patch) => {
+        set({
+          shopLoads: get().shopLoads.map((item) => {
+            if (item.id !== id) return item;
+            const pounds = patch.pounds == null ? item.pounds : Math.min(5000, Math.max(1, Math.round(patch.pounds)));
+            return { ...item, ...patch, pounds };
+          }),
+        });
+      },
+      removeShopLoad: (id) => set({ shopLoads: get().shopLoads.filter((item) => item.id !== id) }),
       applyTemplate: (templateId: string) => {
         const template = TEMPLATES.find((t) => t.id === templateId) ?? TEMPLATES[0];
         set((s) => ({
@@ -437,6 +493,7 @@ export const useShop = create<State>()(
           selectedId: null,
           anchor: null,
           tool: "select",
+          shopLoads: [],
         }));
       },
       startSketch: () => {
@@ -462,6 +519,7 @@ export const useShop = create<State>()(
           selectedId: null,
           anchor: null,
           tool: "post",
+          shopLoads: [],
         }));
       },
       unlockFrame: () => {
@@ -903,7 +961,7 @@ export const useShop = create<State>()(
             straps: [],
             boards: [],
           },
-          { tool: "select", anchor: null, anchorRail: null, draft: null, lumber: null, selectedId: null },
+          { tool: "select", anchor: null, anchorRail: null, draft: null, lumber: null, selectedId: null, shopLoads: [] },
         );
       },
       setClampHeight: (id, height, currentY, otherY) => {
@@ -1330,13 +1388,14 @@ export const useShop = create<State>()(
       duplicate: () => {
         const currentProject = get().projects.find((p) => p.id === get().activeId);
         if (!currentProject) return;
-        const project: Project = { ...currentProject, id: uid(), name: `${currentProject.name} copy` };
+        const project: Project = { ...currentProject, id: uid(), name: `${currentProject.name} copy`, loads: [] };
         set((s) => ({
           ...remember(s),
           projects: [...s.projects, project].slice(-16),
           activeId: project.id,
           selectedId: null,
           anchor: null,
+          shopLoads: [],
         }));
       },
       remove: () => {
@@ -1350,9 +1409,29 @@ export const useShop = create<State>()(
           selectedId: null,
           anchor: null,
           tool: "select",
+          shopLoads: [],
         }));
       },
-      open: (id) => set({ activeId: id, selectedId: null, anchor: null, tool: "select" }),
+      open: (id) => set({ activeId: id, selectedId: null, anchor: null, tool: "select", shopLoads: [], loadMode: false }),
+      importDrawing: (raw) => {
+        const body = drawingBody(raw);
+        if (!body) return false;
+        const named = typeof body.name === "string" && body.name.trim() ? body.name.trim().slice(0, 48) : "Opened drawing";
+        const project = normalizeProject({ ...body, id: uid(), name: named, loads: [] });
+        set((s) => ({
+          ...remember(s),
+          projects: [...s.projects, project].slice(-16),
+          activeId: project.id,
+          selectedId: null,
+          anchor: null,
+          tool: "select",
+          shopLoads: [],
+          loadMode: false,
+          draft: null,
+          move: null,
+        }));
+        return true;
+      },
     }),
     {
       name: "clampwright-v1",
