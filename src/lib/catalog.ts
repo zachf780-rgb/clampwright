@@ -75,7 +75,7 @@ export const TRADES: Trade[] = [
     lbPerFt: 0.67,
     shims: false,
     summary:
-      "Stiffer, heavier, and its own fitting family. T, 90°, 180°, 4-way, 5-way, 45°, hinge, coupling, and flange are all sold for 1\" EMT. The 1\" clamps cost more than the 3/4\" ones and will not grab 3/4\" tube.",
+      "Stiffer, heavier, and its own fitting family. T, 90°, 180°, 4-way, 5-way, 45°, hinge, coupling, and flange are all sold for 1\" EMT. A 1\" clamp grabs 3/4\" EMT with one 1\" to 3/4\" shim per pipe. It will not grab 1/2\" tube.",
   },
 ];
 
@@ -249,10 +249,40 @@ export const SHIM_PRICE = 0.1;
 /** 1" clamp onto 3/4" EMT. MakerPipe sells this shim; 1/2" into a 1" clamp is not a published fit. */
 export const ONE_SHIM_PRICE = 0.15;
 
+/** Conduit end plug. One order is 10 caps. 1/2" and 3/4" are $4.95; 1" is $5.95. */
+export const CAP_PACK = 10;
+export const CAP_PACK_PRICE = 4.95;
+export const CAP_PACK_PRICE_ONE = 5.95;
+
+export function capPackPrice(trade: TradeId): number {
+  return trade === "one" ? CAP_PACK_PRICE_ONE : CAP_PACK_PRICE;
+}
+
+/** Price of one cap inside a pack of 10. */
+export function capEach(trade: TradeId): number {
+  return capPackPrice(trade) / CAP_PACK;
+}
+
 /** One-hole strap. A pack of 4 is $1.95. It snaps onto 1/2", 3/4", or 1" EMT and screws to wood. It does not shorten the pipe. */
 export const STRAP_PACK = 4;
 export const STRAP_PACK_PRICE = 1.95;
 export const STRAP_PRICE = STRAP_PACK_PRICE / STRAP_PACK;
+
+/** NorthWoods EMT conduit hinge set. One order is two offset hinges plus 1/4" bolts. 3/4" and 1" only. */
+export const LEAF_SET_PRICE = 19.95;
+export const LEAF_SET_COUNT = 2;
+
+/** Inline barrel. 4" tall, 0.94" outside diameter. Clamped like a stub of conduit. */
+export const BARREL_PRICE = 8.49;
+export const BARREL_LENGTH = 4;
+export const BARREL_OD = 0.94;
+
+/** Complete adjustable angle connector, not the puzzle-piece half. 1/2" price includes its shims. */
+export const ANGLE_HINGE_PRICE: Record<TradeId, number> = {
+  half: 7.69,
+  "three-quarter": 7.49,
+  one: 9.49,
+};
 
 const SKU_SHORT: Record<Sku, string> = {
   T: "T",

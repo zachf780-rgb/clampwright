@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { endHeights, explodeGrid, fortyFiveLayout, hostOffsetT, moveClamp, normalizeProject, nudgeFortyFive, railRunError, snapSketch, buildProject, type FortyDir, type FullProject, type MeasureRef, type Project, type SketchLink, type SketchNode, type TradeId } from "./build";
+import { endHeights, explodeGrid, fortyFiveLayout, hingeOpenMax, hostOffsetT, moveClamp, normalizeProject, nudgeFortyFive, railRunError, reseatHosts, snapSketch, squareFrom, buildProject, doorFrame, type FortyDir, type FullProject, type HingeKind, type MeasureRef, type Project, type SketchLink, type SketchNode, type TradeId } from "./build";
 import { tradeById } from "./catalog";
 import { canPlaceLumber, clampAnchor, layoutBoard, nudgeBoardSlide, pruneBoards, sheetCoverWidth, strapPoints, STOCK_MAP, WOOD_SKUS, type Board, type BoardAnchor, type BoardFace, type BoardRun, type LayoutContext, type SlideAxis, type StockId } from "./lumber";
 import type { ShopLoad } from "./load";
@@ -20,7 +20,7 @@ const base = {
   railHeight: 34,
 };
 
-export type Tool = "select" | "post" | "rail" | "erase" | "measure" | "lumber";
+export type Tool = "select" | "post" | "rail" | "hinge" | "door" | "erase" | "measure" | "lumber";
 
 export type Template = {
   id: string;
@@ -237,6 +237,9 @@ type State = {
   showMeasures: boolean;
   showLabels: boolean;
   showLumber: boolean;
+  /** Pale hinge gate. Off hides it except while the Hinge tool is open. */
+  showHingePreview: boolean;
+  doorNote: string | null;
   /** Load-test screen. Weights are not saved with the drawing. */
   loadMode: boolean;
   loadTool: "weight" | "push";
@@ -251,6 +254,10 @@ type State = {
   setShowMeasures: (show: boolean) => void;
   setShowLabels: (show: boolean) => void;
   setShowLumber: (show: boolean) => void;
+  setShowHingePreview: (show: boolean) => void;
+  placeDoor: (memberId: string, width: number) => void;
+  setDoorWidth: (id: string, width: number) => void;
+  removeDoor: (id: string) => void;
   setLoadMode: (on: boolean) => void;
   setLoadTool: (tool: "weight" | "push") => void;
   addShopLoad: (target: string, t: number) => string;
@@ -274,9 +281,16 @@ type State = {
   startSketch: () => void;
   unlockFrame: () => void;
   placePost: (x: number, z: number) => void;
+  placeTip: (x: number, z: number) => void;
   setMemberTrade: (kind: "node" | "link", id: string, trade: TradeId | null) => void;
   setStrapCount: (memberId: string, count: number, lo: number, hi: number) => void;
   moveStrap: (id: string, at: number, lo: number, hi: number) => void;
+  setHingeCount: (memberId: string, count: number, lo: number, hi: number, kind: HingeKind, side: 1 | -1) => void;
+  moveHinge: (id: string, at: number, lo: number, hi: number) => void;
+  setHingeKind: (memberId: string, kind: HingeKind, lo: number, hi: number) => void;
+  setHingeSide: (memberId: string, side: 1 | -1) => void;
+  setHingeSwing: (memberId: string, deg: number) => void;
+  rotateBar: (id: string, degrees: number) => void;
   placeShape: (spec: { width: number; depth: number; across: number; deep: number; height: number; rail: boolean; railAt: number }) => void;
   patchNode: (id: string, patch: Partial<SketchNode>) => void;
   patchLink: (id: string, patch: Partial<SketchLink>) => void;
@@ -340,6 +354,55 @@ function current(get: () => State): Project | undefined {
   return get().projects.find((p) => p.id === get().activeId);
 }
 
+function shiftDoor(project: FullProject, memberId: string, vertical: boolean): FullProject {
+  const door = project.doors.find((item) => item.memberId === memberId);
+  if (!door) return project;
+  const member = buildProject(project).members.find((item) => item.id === memberId);
+  const hinges = project.hinges.filter((hinge) => hinge.memberId === memberId);
+  if (!member) return project;
+  const frame = doorFrame(member, hinges, door.width);
+  if (!frame) return project;
+  const hostId = memberId.startsWith("post:") ? memberId.slice(5).replace(/:hi$/, "") : "";
+  const blocked = (x: number, z: number, near: number) =>
+    project.nodes.some(
+      (node) =>
+        node.id !== hostId &&
+        node.id !== door.hingeNode &&
+        node.id !== door.latchNode &&
+        !node.host &&
+        Math.hypot(node.x - x, node.z - z) < near,
+    );
+  if (blocked(frame.hinge.x, frame.hinge.z, 3) || blocked(frame.latch.x, frame.latch.z, 4)) return project;
+  const nodes = project.nodes.map((node) => {
+    if (node.id === door.hingeNode) {
+      return vertical
+        ? { ...node, x: frame.hinge.x, z: frame.hinge.z, base: frame.hinge.base, height: frame.hinge.height }
+        : { ...node, x: frame.hinge.x, z: frame.hinge.z };
+    }
+    if (node.id === door.latchNode) {
+      return vertical
+        ? { ...node, x: frame.latch.x, z: frame.latch.z, base: frame.latch.base, height: frame.latch.height }
+        : { ...node, x: frame.latch.x, z: frame.latch.z };
+    }
+    return node;
+  });
+  const links = vertical
+    ? project.links.map((link) => {
+        if (link.id === door.bottomRail) return { ...link, y: frame.bottom };
+        if (link.id === door.topRail) return { ...link, y: frame.top };
+        return link;
+      })
+    : project.links;
+  return {
+    ...project,
+    nodes,
+    links,
+    doors: project.doors.map((item) =>
+      item.id === door.id ? { ...item, width: frame.width, dirX: frame.dirX, dirZ: frame.dirZ } : item,
+    ),
+  };
+}
+
 function write(set: (partial: Partial<State> | ((s: State) => Partial<State>)) => void, id: string, next: Project, extra?: Partial<State>) {
   set((s) => {
     const flags = remember(s);
@@ -398,6 +461,8 @@ export const useShop = create<State>()(
       showMeasures: true,
       showLabels: true,
       showLumber: true,
+      showHingePreview: false,
+      doorNote: null,
       loadMode: false,
       loadTool: "weight",
       shopLoads: [],
@@ -419,14 +484,15 @@ export const useShop = create<State>()(
         const cleaned = dropOrphanHosts(project);
         const lumber = tool === "lumber" ? (get().lumber ?? freshLumber()) : null;
         if (cleaned.nodes.length !== project.nodes.length) {
-          write(set, project.id, cleaned, { tool, anchor: null, anchorRail: null, draft: null, move: null, lumber });
+          write(set, project.id, cleaned, { tool, anchor: null, anchorRail: null, draft: null, move: null, lumber, doorNote: null });
           return;
         }
-        set({ tool, anchor: null, anchorRail: null, draft: null, move: null, lumber });
+        set({ tool, anchor: null, anchorRail: null, draft: null, move: null, lumber, doorNote: null });
       },
       setShowMeasures: (showMeasures) => set({ showMeasures }),
       setShowLabels: (showLabels) => set({ showLabels }),
       setShowLumber: (showLumber) => set({ showLumber }),
+      setShowHingePreview: (showHingePreview) => set({ showHingePreview }),
       setLoadMode: (loadMode) =>
         set({
           loadMode,
@@ -526,12 +592,12 @@ export const useShop = create<State>()(
         const project = current(get);
         if (!project || project.mode === "sketch") return;
         const exploded = explodeGrid(project);
-        write(set, project.id, { ...project, mode: "sketch", ...exploded, straps: [] }, { tool: "select", anchor: null, selectedId: null });
+        write(set, project.id, { ...project, mode: "sketch", ...exploded, straps: [], hinges: [], hingeSwing: [], doors: [] }, { tool: "select", anchor: null, selectedId: null, doorNote: null });
       },
       placePost: (x, z) => {
         const project = normalizeProject(current(get) ?? get().projects[0]);
-        if (project.mode !== "sketch" || project.nodes.filter((node) => !node.host).length >= MAX_POSTS) return;
-        const posts = project.nodes.filter((node) => !node.host);
+        if (project.mode !== "sketch" || project.nodes.filter((node) => !node.host && !node.tip).length >= MAX_POSTS) return;
+        const posts = project.nodes.filter((node) => !node.host && !node.tip);
         const snapped = snapSketch(x, z, posts);
         if (posts.some((n) => Math.hypot(n.x - snapped.x, n.z - snapped.z) < 4)) return;
         const node: SketchNode = {
@@ -542,6 +608,39 @@ export const useShop = create<State>()(
           flange: false,
         };
         write(set, project.id, { ...project, nodes: [...project.nodes, node] }, { selectedId: `post:${node.id}` });
+      },
+      placeTip: (x, z) => {
+        const draft = get().draft;
+        const project = normalizeProject(current(get) ?? get().projects[0]);
+        if (project.mode !== "sketch" || !draft || draft.stops.length < 1 || draft.stops.length >= 24) return;
+        if (project.nodes.length >= 48) return;
+        const last = draft.stops[draft.stops.length - 1];
+        const y = Math.min(240, Math.max(1, last.y));
+        const posts = project.nodes.filter((node) => !node.host && !node.tip);
+        const snapped = snapSketch(x, z, posts);
+        if (posts.some((node) => Math.hypot(node.x - snapped.x, node.z - snapped.z) < 6)) return;
+        const lastNode = project.nodes.find((node) => node.id === last.nodeId);
+        if (!lastNode || lastNode.tip) return;
+        const squared = squareFrom(lastNode, snapped.x, snapped.z);
+        if (Math.hypot(lastNode.x - squared.x, lastNode.z - squared.z) < 6) {
+          const dx = x - lastNode.x;
+          const dz = z - lastNode.z;
+          if (Math.abs(dx) >= Math.abs(dz)) squared.x = Math.round((lastNode.x + (dx >= 0 ? 12 : -12)) * 32) / 32;
+          else squared.z = Math.round((lastNode.z + (dz >= 0 ? 12 : -12)) * 32) / 32;
+        }
+        if (posts.some((node) => Math.hypot(node.x - squared.x, node.z - squared.z) < 6)) return;
+        if (Math.hypot(lastNode.x - squared.x, lastNode.z - squared.z) < 6) return;
+        const node: SketchNode = { id: uid(), x: squared.x, z: squared.z, height: y, flange: false, tip: true };
+        const stops = [...draft.stops, { nodeId: node.id, railId: null, y }];
+        const leans = [...(draft.leans ?? [])];
+        while (leans.length < stops.length - 1) leans.push(null);
+        leans.length = Math.max(0, stops.length - 1);
+        write(
+          set,
+          project.id,
+          { ...project, nodes: [...project.nodes, node] },
+          { draft: { ...draft, stops, leans, fortyFiveError: null }, anchor: null, anchorRail: null, selectedId: null },
+        );
       },
       setMemberTrade: (kind, id, trade) => {
         const project = normalizeProject(current(get) ?? get().projects[0]);
@@ -594,6 +693,215 @@ export const useShop = create<State>()(
           ...project,
           straps: project.straps.map((strap) => (strap.id === id ? { ...strap, at: clampStrap(at, lo, hi) } : strap)),
         });
+      },
+      setHingeCount: (memberId, count, lo, hi, kind, side) => {
+        const project = normalizeProject(current(get) ?? get().projects[0]);
+        const n = Math.max(0, Math.min(6, Math.round(count)));
+        const others = project.hinges.filter((hinge) => hinge.memberId !== memberId);
+        let mine = project.hinges
+          .filter((hinge) => hinge.memberId === memberId)
+          .map((hinge) => ({ ...hinge, kind, side, at: clampStrap(hinge.at, lo, hi) }))
+          .sort((a, b) => a.at - b.at);
+        while (mine.length < n) {
+          const marks = [lo, ...mine.map((hinge) => hinge.at), hi].sort((a, b) => a - b);
+          let gap = -1;
+          let at = (lo + hi) / 2;
+          for (let i = 0; i < marks.length - 1; i += 1) {
+            const room = marks[i + 1] - marks[i];
+            if (room > gap + 1e-6) {
+              gap = room;
+              at = (marks[i] + marks[i + 1]) / 2;
+            }
+          }
+          mine.push({ id: uid(), memberId, kind, side, at: clampStrap(at, lo, hi) });
+          mine.sort((a, b) => a.at - b.at);
+        }
+        if (mine.length > n) mine = mine.slice(0, n);
+        const hinges = [...others, ...mine];
+        const swing = n === 0 ? project.hingeSwing.filter((item) => item.memberId !== memberId) : project.hingeSwing;
+        write(set, project.id, shiftDoor({ ...project, hinges, hingeSwing: swing }, memberId, true));
+      },
+      moveHinge: (id, at, lo, hi) => {
+        const project = normalizeProject(current(get) ?? get().projects[0]);
+        const hinges = project.hinges.map((hinge) => (hinge.id === id ? { ...hinge, at: clampStrap(at, lo, hi) } : hinge));
+        const memberId = hinges.find((hinge) => hinge.id === id)?.memberId;
+        write(set, project.id, memberId ? shiftDoor({ ...project, hinges }, memberId, true) : { ...project, hinges });
+      },
+      setHingeKind: (memberId, kind, lo, hi) => {
+        const project = normalizeProject(current(get) ?? get().projects[0]);
+        const hinges = project.hinges.map((hinge) =>
+          hinge.memberId === memberId ? { ...hinge, kind, at: clampStrap(hinge.at, lo, hi) } : hinge,
+        );
+        const max = hingeOpenMax(kind);
+        const next = shiftDoor({ ...project, hinges }, memberId, true);
+        write(set, project.id, {
+          ...next,
+          hingeSwing: next.hingeSwing.map((item) => (item.memberId === memberId ? { ...item, deg: Math.min(item.deg, max) } : item)),
+        });
+      },
+      setHingeSide: (memberId, side) => {
+        const project = normalizeProject(current(get) ?? get().projects[0]);
+        const hinges = project.hinges.map((hinge) => (hinge.memberId === memberId ? { ...hinge, side } : hinge));
+        write(set, project.id, shiftDoor({ ...project, hinges }, memberId, false));
+      },
+      setHingeSwing: (memberId, deg) => {
+        const project = normalizeProject(current(get) ?? get().projects[0]);
+        const kind = project.hinges.find((hinge) => hinge.memberId === memberId)?.kind ?? "leaf";
+        const next = Math.round(Math.min(hingeOpenMax(kind), Math.max(0, deg)));
+        const rest = project.hingeSwing.filter((item) => item.memberId !== memberId);
+        write(set, project.id, {
+          ...project,
+          hingeSwing: next <= 0 ? rest : [...rest, { memberId, deg: next }],
+        });
+      },
+      placeDoor: (memberId, width) => {
+        const project = normalizeProject(current(get) ?? get().projects[0]);
+        if (project.mode !== "sketch") {
+          set({ doorNote: "Choose Edit these posts freely before hanging a door." });
+          return;
+        }
+        if (project.doors.some((door) => door.memberId === memberId)) {
+          set({ doorNote: null });
+          return;
+        }
+        if (project.nodes.filter((node) => !node.host && !node.tip).length + 2 > MAX_POSTS) {
+          set({ doorNote: "This drawing is full. Remove a post before adding a door." });
+          return;
+        }
+        if (project.links.length + 2 > MAX_LINKS) {
+          set({ doorNote: "This drawing is full. Remove a rail before adding a door." });
+          return;
+        }
+        const built = buildProject(project);
+        const member = built.members.find((item) => item.id === memberId);
+        const hinges = project.hinges.filter((hinge) => hinge.memberId === memberId);
+        if (!member || hinges.some((hinge) => hinge.kind === "angle") || !hinges.length) {
+          set({ doorNote: hinges.some((hinge) => hinge.kind === "angle") ? "An angle hinge folds a pipe. A door needs offset or barrel hinges." : "Add offset or barrel hinges on an upright post first." });
+          return;
+        }
+        const frame = doorFrame(member, hinges, width);
+        if (!frame) {
+          set({ doorNote: "A door hangs on hinges on an upright post." });
+          return;
+        }
+        const hostId = memberId.startsWith("post:") ? memberId.slice(5).replace(/:hi$/, "") : "";
+        const blocked = (x: number, z: number, near: number) =>
+          project.nodes.some((node) => node.id !== hostId && !node.host && Math.hypot(node.x - x, node.z - z) < near);
+        if (blocked(frame.hinge.x, frame.hinge.z, 3) || blocked(frame.latch.x, frame.latch.z, 4)) {
+          set({ doorNote: "That width lands on another post. Try a different width." });
+          return;
+        }
+        const doorId = uid();
+        const hingeId = uid();
+        const latchId = uid();
+        const bottomId = uid();
+        const topId = uid();
+        const stile = (id: string, at: { x: number; z: number; base: number; height: number }): SketchNode => ({
+          id,
+          x: at.x,
+          z: at.z,
+          height: at.height,
+          base: at.base,
+          flange: false,
+          door: doorId,
+        });
+        write(
+          set,
+          project.id,
+          {
+            ...project,
+            nodes: [...project.nodes, stile(hingeId, frame.hinge), stile(latchId, frame.latch)],
+            links: [
+              ...project.links,
+              { id: bottomId, a: hingeId, b: latchId, y: frame.bottom, kind: "rail" },
+              { id: topId, a: hingeId, b: latchId, y: frame.top, kind: "rail" },
+            ],
+            doors: [
+              ...project.doors,
+              {
+                id: doorId,
+                memberId,
+                width: frame.width,
+                hingeNode: hingeId,
+                latchNode: latchId,
+                bottomRail: bottomId,
+                topRail: topId,
+                dirX: frame.dirX,
+                dirZ: frame.dirZ,
+              },
+            ],
+          },
+          { doorNote: null, selectedId: `post:${latchId}` },
+        );
+      },
+      setDoorWidth: (id, width) => {
+        const project = normalizeProject(current(get) ?? get().projects[0]);
+        const door = project.doors.find((item) => item.id === id);
+        if (!door) return;
+        const next = Math.round(Math.min(96, Math.max(8, width)) * 32) / 32;
+        const hinge = project.nodes.find((node) => node.id === door.hingeNode);
+        if (!hinge) return;
+        const x = Math.round((hinge.x + door.dirX * next) * 32) / 32;
+        const z = Math.round((hinge.z + door.dirZ * next) * 32) / 32;
+        const blocked = project.nodes.some(
+          (node) => node.id !== door.latchNode && node.id !== door.hingeNode && !node.host && Math.hypot(node.x - x, node.z - z) < 4,
+        );
+        if (blocked) {
+          set({ doorNote: "That width lands on another post." });
+          return;
+        }
+        write(set, project.id, {
+          ...project,
+          nodes: project.nodes.map((node) => (node.id === door.latchNode ? { ...node, x, z } : node)),
+          doors: project.doors.map((item) => (item.id === id ? { ...item, width: Math.hypot(x - hinge.x, z - hinge.z) } : item)),
+        }, { doorNote: null });
+      },
+      removeDoor: (id) => {
+        const project = normalizeProject(current(get) ?? get().projects[0]);
+        const door = project.doors.find((item) => item.id === id);
+        if (!door) return;
+        const dropped = new Set(project.nodes.filter((node) => node.door === id).map((node) => node.id));
+        const links = project.links.filter((link) => !dropped.has(link.a) && !dropped.has(link.b));
+        const gone = [...dropped];
+        const straps = project.straps.filter((strap) => !gone.some((nodeId) => strap.memberId.includes(nodeId)));
+        write(
+          set,
+          project.id,
+          {
+            ...project,
+            nodes: project.nodes.filter((node) => !dropped.has(node.id)),
+            links,
+            doors: project.doors.filter((item) => item.id !== id),
+            straps,
+            boards: pruneBoards(
+              project.boards,
+              (ref) => ref.startsWith("strap:") ? !straps.some((strap) => strap.id === ref.slice(6)) : gone.some((nodeId) => ref.includes(nodeId)),
+            ),
+          },
+          { selectedId: null, doorNote: null },
+        );
+      },
+      rotateBar: (id, degrees) => {
+        const project = normalizeProject(current(get) ?? get().projects[0]);
+        const link = project.links.find((item) => item.id === id);
+        if (!link) return;
+        const a = project.nodes.find((node) => node.id === link.a);
+        const b = project.nodes.find((node) => node.id === link.b);
+        if (!a || !b || a.host || b.host) return;
+        const moveA = a.tip && !b.tip;
+        const pivot = moveA ? b : a;
+        const moving = moveA ? a : b;
+        const span = Math.hypot(b.x - a.x, b.z - a.z);
+        if (span < 1) return;
+        const rad = (degrees * Math.PI) / 180;
+        const dir = moveA ? -1 : 1;
+        const x = Math.round((pivot.x + dir * Math.cos(rad) * span) * 32) / 32;
+        const z = Math.round((pivot.z + dir * Math.sin(rad) * span) * 32) / 32;
+        const blocked = project.nodes.some((node) => node.id !== moving.id && !node.host && Math.hypot(node.x - x, node.z - z) < 4);
+        if (blocked) return;
+        const nodes = project.nodes.map((node) => (node.id === moving.id ? { ...node, x, z } : node));
+        const seated = reseatHosts(nodes, project.links);
+        write(set, project.id, { ...project, nodes: seated.nodes, links: seated.links });
       },
       placeShape: (spec) => {
         const project = normalizeProject(current(get) ?? get().projects[0]);
@@ -672,9 +980,21 @@ export const useShop = create<State>()(
         const others = project.nodes.filter((n) => n.id !== id);
         const snapped = snapSketch(x, z, others);
         if (others.some((n) => Math.hypot(n.x - snapped.x, n.z - snapped.z) < 4)) return;
+        const nodes = project.nodes.map((n) => (n.id === id ? { ...n, x: snapped.x, z: snapped.z } : n));
+        const movedDoor = project.doors.find((door) => door.hingeNode === id || door.latchNode === id);
+        const doors = movedDoor
+          ? project.doors.map((door) => {
+              if (door.id !== movedDoor.id) return door;
+              const hinge = nodes.find((node) => node.id === door.hingeNode);
+              const latch = nodes.find((node) => node.id === door.latchNode);
+              if (!hinge || !latch) return door;
+              return { ...door, width: Math.round(Math.hypot(latch.x - hinge.x, latch.z - hinge.z) * 32) / 32 };
+            })
+          : project.doors;
         write(set, project.id, {
           ...project,
-          nodes: project.nodes.map((n) => (n.id === id ? { ...n, x: snapped.x, z: snapped.z } : n)),
+          nodes,
+          doors,
         });
       },
       movePostHeight: (id, height) => {
@@ -729,6 +1049,17 @@ export const useShop = create<State>()(
         while (guard < 8) {
           guard += 1;
           const before = dropped.size;
+          for (const node of project.nodes) {
+            if (dropped.has(node.id) && node.door) {
+              for (const mate of project.nodes) if (mate.door === node.door) dropped.add(mate.id);
+            }
+          }
+          for (const door of project.doors) {
+            const hostId = door.memberId.startsWith("post:") ? door.memberId.slice(5).replace(/:hi$/, "") : "";
+            if ((hostId && dropped.has(hostId)) || dropped.has(door.hingeNode) || dropped.has(door.latchNode)) {
+              for (const mate of project.nodes) if (mate.door === door.id) dropped.add(mate.id);
+            }
+          }
           for (const link of links) {
             if (dropped.has(link.a) || dropped.has(link.b)) {
               for (const node of project.nodes) if (node.host === link.id) dropped.add(node.id);
@@ -736,10 +1067,15 @@ export const useShop = create<State>()(
           }
           links = links.filter((link) => !dropped.has(link.a) && !dropped.has(link.b));
           for (const node of project.nodes) if (node.host && !links.some((link) => link.id === node.host)) dropped.add(node.id);
+          for (const node of project.nodes) {
+            if (node.tip && !links.some((link) => link.a === node.id || link.b === node.id)) dropped.add(node.id);
+          }
           if (dropped.size === before) break;
         }
         const deadLinks = project.links.filter((link) => !links.some((item) => item.id === link.id)).map((link) => link.id);
         const gone = [...dropped, ...deadLinks];
+        const dead = deadMembers(dropped, project.links, links);
+        const straps = project.straps.filter((strap) => !dead.has(strap.memberId));
         write(
           set,
           project.id,
@@ -747,29 +1083,42 @@ export const useShop = create<State>()(
             ...project,
             nodes: project.nodes.filter((node) => !dropped.has(node.id)),
             links,
-            straps: project.straps.filter((strap) => !deadMembers(dropped, project.links, links).has(strap.memberId)),
-            boards: pruneBoards(project.boards, (ref) => gone.some((goneId) => ref.includes(goneId))),
+            doors: project.doors.filter((door) => !dropped.has(door.hingeNode) && !dropped.has(door.latchNode)),
+            straps,
+            hinges: project.hinges.filter((hinge) => !hingeGone(hinge.memberId, dead)),
+            hingeSwing: project.hingeSwing.filter((item) => !hingeGone(item.memberId, dead)),
+            boards: pruneBoards(project.boards, (ref) =>
+              ref.startsWith("strap:") ? !straps.some((strap) => strap.id === ref.slice(6)) : gone.some((goneId) => ref.includes(goneId)),
+            ),
           },
-          { selectedId: null, anchor: get().anchor === id ? null : get().anchor },
+          { selectedId: null, anchor: get().anchor === id ? null : get().anchor, doorNote: null },
         );
       },
       removeLink: (id) => {
         const project = normalizeProject(current(get) ?? get().projects[0]);
         const hosts = new Set(project.nodes.filter((node) => node.host === id).map((node) => node.id));
         const links = project.links.filter((link) => link.id !== id && !hosts.has(link.a) && !hosts.has(link.b));
+        const orphanTips = new Set(
+          project.nodes.filter((node) => node.tip && !links.some((link) => link.a === node.id || link.b === node.id)).map((node) => node.id),
+        );
         const dead = deadMembers(hosts, project.links, links);
         dead.add(`rail:${id}`);
         dead.add(`brace:${id}`);
         const gone = [id, ...hosts];
+        const straps = project.straps.filter((strap) => !dead.has(strap.memberId));
         write(
           set,
           project.id,
           {
             ...project,
-            nodes: project.nodes.filter((node) => !hosts.has(node.id)),
+            nodes: project.nodes.filter((node) => !hosts.has(node.id) && !orphanTips.has(node.id)),
             links,
-            straps: project.straps.filter((strap) => !dead.has(strap.memberId)),
-            boards: pruneBoards(project.boards, (ref) => gone.some((goneId) => ref.includes(goneId))),
+            straps,
+            hinges: project.hinges.filter((hinge) => !hingeGone(hinge.memberId, dead)),
+            hingeSwing: project.hingeSwing.filter((item) => !hingeGone(item.memberId, dead)),
+            boards: pruneBoards(project.boards, (ref) =>
+              ref.startsWith("strap:") ? !straps.some((strap) => strap.id === ref.slice(6)) : gone.some((goneId) => ref.includes(goneId)),
+            ),
           },
           { selectedId: null },
         );
@@ -959,6 +1308,9 @@ export const useShop = create<State>()(
             railHeight: 34,
             references: [],
             straps: [],
+            hinges: [],
+            hingeSwing: [],
+            doors: [],
             boards: [],
           },
           { tool: "select", anchor: null, anchorRail: null, draft: null, lumber: null, selectedId: null, shopLoads: [] },
@@ -990,9 +1342,17 @@ export const useShop = create<State>()(
           {
             ...project,
             links: moved.links,
-            nodes: project.nodes.map((node) =>
-              node.id === postId && node.height < h + 1 ? { ...node, height: Math.min(240, Math.max(12, h + 1)) } : node,
-            ),
+            nodes: project.nodes.map((node) => {
+              if (node.id !== postId || node.tip) return node;
+              const tracking = typeof node.split === "number" && Math.abs(node.split - currentY) <= 0.75;
+              const need = tracking ? h + 2 : h + 1;
+              const grow = node.height < need ? Math.min(240, Math.max(12, need)) : node.height;
+              if (tracking) {
+                const split = Math.min(grow - 1.05, Math.max(1.05, Math.round(h * 32) / 32));
+                return { ...node, height: grow, split };
+              }
+              return grow === node.height ? node : { ...node, height: grow };
+            }),
           },
           { selectedId: moved.selectedId },
         );
@@ -1110,7 +1470,7 @@ export const useShop = create<State>()(
           keep.add(link.a);
           keep.add(link.b);
         }
-        const nodes = project.nodes.filter((node) => !node.host || keep.has(node.id));
+        const nodes = project.nodes.filter((node) => (!node.host && !node.tip) || keep.has(node.id));
         const leans = (draft.leans ?? []).slice(0, Math.max(0, stops.length - 1));
         const next = stops.length ? { ...draft, stops, leans, fortyFiveError: null } : null;
         if (nodes.length !== project.nodes.length) write(set, project.id, { ...project, nodes }, { draft: next, anchor: null, anchorRail: null });
@@ -1247,6 +1607,10 @@ export const useShop = create<State>()(
           grown.set(to.nodeId, Math.max(grown.get(to.nodeId) ?? 0, yB));
         }
         const nodes = project.nodes.map((node) => {
+          if (node.tip) {
+            const need = grown.get(node.id);
+            return need == null ? node : { ...node, height: need, flange: false, bury: 0 };
+          }
           if (node.host) return node;
           const need = grown.get(node.id) ?? 0;
           return need > node.height - 1 ? { ...node, height: Math.min(240, Math.max(12, need + 1)) } : node;
@@ -1444,6 +1808,7 @@ export const useShop = create<State>()(
           showMeasures?: boolean;
           showLabels?: boolean;
           showLumber?: boolean;
+          showHingePreview?: boolean;
         };
         let projects: Project[] = (state.projects ?? []).map((p) => normalizeProject(p));
         const stock =
@@ -1461,6 +1826,7 @@ export const useShop = create<State>()(
           showMeasures: state.showMeasures ?? true,
           showLabels: state.showLabels ?? true,
           showLumber: state.showLumber ?? true,
+          showHingePreview: state.showHingePreview ?? false,
         };
       },
       partialize: (s) => ({
@@ -1470,6 +1836,7 @@ export const useShop = create<State>()(
         showMeasures: s.showMeasures,
         showLabels: s.showLabels,
         showLumber: s.showLumber,
+        showHingePreview: s.showHingePreview,
       }),
     },
   ),
@@ -1492,6 +1859,12 @@ function deadMembers(dropped: Set<string>, before: { id: string }[], after: { id
     }
   }
   return dead;
+}
+
+function hingeGone(memberId: string, dead: Set<string>): boolean {
+  if (dead.has(memberId)) return true;
+  const upper = memberId.endsWith(":hi") ? memberId.slice(0, -3) : "";
+  return upper.length > 0 && dead.has(upper);
 }
 
 function roundQuarter(n: number): number {
@@ -1594,20 +1967,23 @@ function dropOrphanHosts<T extends { nodes: SketchNode[]; links: SketchLink[] }>
     used.add(link.a);
     used.add(link.b);
   }
-  const nodes = project.nodes.filter((node) => !node.host || used.has(node.id));
+  const nodes = project.nodes.filter((node) => (!node.host && !node.tip) || used.has(node.id));
   if (nodes.length === project.nodes.length) return project;
   return { ...project, nodes };
 }
 
 function nodeFromHit(id: string): string | null {
-  if (id.startsWith("post:")) return id.slice(5);
+  if (id.startsWith("post:")) {
+    const rest = id.slice(5);
+    return rest.endsWith(":hi") ? rest.slice(0, -3) : rest;
+  }
   if (id.startsWith("flange:")) return id.slice(7);
   if (id.startsWith("fit:")) return id.slice(4).split(":")[0] ?? null;
   return null;
 }
 
 function linkFromHit(id: string): string | null {
-  if (id.startsWith("rail:") || id.startsWith("brace:")) return id.slice(id.indexOf(":") + 1);
+  if (id.startsWith("rail:") || id.startsWith("brace:")) return id.slice(id.indexOf(":") + 1).replace(/:stub[AB]$/, "");
   if (id.startsWith("hinge:") || id.startsWith("bfit:")) return id.slice(id.indexOf(":") + 1).split(":")[0] ?? null;
   return null;
 }

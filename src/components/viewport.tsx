@@ -2,8 +2,8 @@ import { Grid, Html, Line, OrbitControls } from "@react-three/drei";
 import { Canvas, useThree, type ThreeEvent } from "@react-three/fiber";
 import { useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import * as THREE from "three";
-import type { Branch, Build, Fitting, FullProject, MeasureRef, Member, Project, Segment, Strap, Vec3 } from "@/lib/build";
-import { endHeights, fortyFiveButtons, normalizeProject, sheetIndex, snapSketch } from "@/lib/build";
+import type { Branch, Build, Fitting, FullProject, Hinge, HingeSwing, MeasureRef, Member, Project, Segment, Strap, Vec3 } from "@/lib/build";
+import { endHeights, fortyFiveButtons, normalizeProject, poseSwung, sheetIndex, snapSketch, squareFrom } from "@/lib/build";
 import { tradeById } from "@/lib/catalog";
 import { formatLen } from "@/lib/format";
 import { boardLook, canPlaceLumber, layoutBoard, strapPoints, STOCK_MAP, WOOD_SKUS, type Board, type LayoutContext, type SlideAxis } from "@/lib/lumber";
@@ -548,6 +548,21 @@ function Shove({ mark, hot, onPick }: { mark: LoadMark; hot?: boolean; onPick: (
   );
 }
 
+function CapPlug({ at, axis, radius }: { at: Vec3; axis: Vec3; radius: number }) {
+  return (
+    <group position={at} quaternion={quatFrom(axis)}>
+      <mesh position={[0, -Math.max(0.28, radius * 0.7), 0]}>
+        <cylinderGeometry args={[radius * 0.82, radius * 0.82, Math.max(0.45, radius * 1.15), 16]} />
+        <meshStandardMaterial color="#3f4440" metalness={0.42} roughness={0.52} />
+      </mesh>
+      <mesh position={[0, 0.05, 0]}>
+        <cylinderGeometry args={[radius * 1.05, radius * 1.05, 0.1, 18]} />
+        <meshStandardMaterial color="#3f4440" metalness={0.5} roughness={0.46} />
+      </mesh>
+    </group>
+  );
+}
+
 function MemberMesh({
   member,
   radius,
@@ -623,6 +638,9 @@ function MemberMesh({
       ) : null}
       {straps.map((strap) => (
         <StrapRing key={strap.id} member={member} strapId={strap.id} at={strap.at} radius={radius} glow={strapGlow} onPick={onStrap} />
+      ))}
+      {member.capAt.map((cap, index) => (
+        <CapPlug key={`cap${index}`} at={cap.at} axis={cap.axis} radius={radius} />
       ))}
     </group>
   );
@@ -918,15 +936,28 @@ function moved(event: ThreeEvent<MouseEvent>, down: { x: number; y: number } | n
   return Math.hypot(event.nativeEvent.clientX - down.x, event.nativeEvent.clientY - down.y) > 6;
 }
 
+function samePiece(selected: string | null, memberId: string): boolean {
+  if (!selected) return false;
+  const bare = (id: string) => id.replace(/:hi$/, "").replace(/:stub[AB]$/, "");
+  const post = selected.startsWith("post:") && memberId.startsWith("post:");
+  const rail = selected.startsWith("rail:") && memberId.startsWith("rail:");
+  if (post || rail) return bare(selected) === bare(memberId);
+  return selected === memberId;
+}
+
 function Floor({
   tool,
+  tipping,
   onPlace,
+  onTip,
   onClear,
   onHover,
   onPoint,
 }: {
   tool: Tool;
+  tipping: boolean;
   onPlace: (x: number, z: number) => void;
+  onTip: (x: number, z: number) => void;
   onClear: () => void;
   onHover: (point: { x: number; z: number } | null) => void;
   onPoint: (point: Vec3) => void;
@@ -940,7 +971,7 @@ function Floor({
         down.current = { x: e.nativeEvent.clientX, y: e.nativeEvent.clientY };
       }}
       onPointerMove={(e) => {
-        if (tool !== "post") return;
+        if (tool !== "post" && !(tool === "rail" && tipping)) return;
         onHover({ x: e.point.x, z: e.point.z });
       }}
       onPointerOut={() => onHover(null)}
@@ -948,6 +979,7 @@ function Floor({
         if (moved(e, down.current)) return;
         e.stopPropagation();
         if (tool === "post") onPlace(e.point.x, e.point.z);
+        else if (tool === "rail" && tipping) onTip(e.point.x, e.point.z);
         else if (tool === "measure") onPoint([e.point.x, e.point.y, e.point.z]);
         else onClear();
       }}
@@ -1219,6 +1251,260 @@ function LeanArrows() {
 }
 
 
+function pointOn(member: Member, at: number): THREE.Vector3 {
+  const span = Math.hypot(member.b[0] - member.a[0], member.b[1] - member.a[1], member.b[2] - member.a[2]) || 1;
+  const t = at / span;
+  return new THREE.Vector3(
+    member.a[0] + (member.b[0] - member.a[0]) * t,
+    member.a[1] + (member.b[1] - member.a[1]) * t,
+    member.a[2] + (member.b[2] - member.a[2]) * t,
+  );
+}
+
+function hingeBasis(member: Member, side: 1 | -1): { axis: THREE.Vector3; face: THREE.Vector3; quat: THREE.Quaternion } {
+  const axis = new THREE.Vector3(member.b[0] - member.a[0], member.b[1] - member.a[1], member.b[2] - member.a[2]);
+  if (axis.lengthSq() < 1e-6) axis.set(0, 1, 0);
+  axis.normalize();
+  let face = new THREE.Vector3(-axis.z, 0, axis.x);
+  if (face.lengthSq() < 0.04) face.set(1, 0, 0);
+  face.addScaledVector(axis, -face.dot(axis));
+  if (face.lengthSq() < 1e-8) face.set(1, 0, 0);
+  face.normalize().multiplyScalar(side);
+  const latch = new THREE.Vector3().crossVectors(face, axis).normalize();
+  const quat = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(face, axis, latch));
+  return { axis, face, quat };
+}
+
+function HingeStage({
+  members,
+  hinges,
+  swings,
+  frameTrade,
+  selected,
+  doorMembers,
+  mode,
+  onPick,
+}: {
+  members: Member[];
+  hinges: Hinge[];
+  swings: HingeSwing[];
+  frameTrade: Project["trade"];
+  selected: string | null;
+  doorMembers: Set<string>;
+  mode: "hidden" | "preview" | "pick";
+  onPick: (id: string) => void;
+}) {
+  if (mode === "hidden") return null;
+  const groups = new Map<string, Hinge[]>();
+  for (const hinge of hinges) {
+    if (hinge.kind === "angle") continue;
+    const list = groups.get(hinge.memberId) ?? [];
+    list.push(hinge);
+    groups.set(hinge.memberId, list);
+  }
+  const angles = mode === "preview" ? hinges.filter((hinge) => hinge.kind === "angle") : [];
+  return (
+    <group>
+      {[...groups.entries()].map(([memberId, list]) => {
+        const member = members.find((item) => item.id === memberId);
+        if (!member) return null;
+        return (
+          <GateLeaf
+            key={memberId}
+            member={member}
+            hinges={list}
+            deg={swings.find((item) => item.memberId === memberId)?.deg ?? 0}
+            shim={(member.trade ?? frameTrade) !== "three-quarter" && list[0]?.kind === "barrel"}
+            hot={selected === memberId}
+            showGate={mode === "preview" && !doorMembers.has(memberId)}
+            pick={mode === "pick"}
+            onPick={() => onPick(memberId)}
+          />
+        );
+      })}
+      {angles.map((hinge) => {
+        const member = members.find((item) => item.id === hinge.memberId);
+        if (!member) return null;
+        return (
+          <AngleArm
+            key={hinge.id}
+            member={member}
+            hinge={hinge}
+            deg={swings.find((item) => item.memberId === hinge.memberId)?.deg ?? 0}
+            hot={selected === hinge.memberId}
+            onPick={() => onPick(hinge.memberId)}
+          />
+        );
+      })}
+    </group>
+  );
+}
+
+function GateLeaf({
+  member,
+  hinges,
+  deg,
+  shim,
+  hot,
+  showGate,
+  pick,
+  onPick,
+}: {
+  member: Member;
+  hinges: Hinge[];
+  deg: number;
+  shim: boolean;
+  hot: boolean;
+  showGate: boolean;
+  pick: boolean;
+  onPick: () => void;
+}) {
+  const kind = hinges[0]?.kind ?? "leaf";
+  const side = hinges[0]?.side ?? 1;
+  const { face, quat } = hingeBasis(member, side);
+  const ats = hinges.map((hinge) => hinge.at);
+  const mid = (Math.min(...ats) + Math.max(...ats)) / 2;
+  const pivotAt = pointOn(member, mid);
+  const radius = 0.46;
+  const offset = kind === "barrel" ? 0 : radius + 0.42;
+  const pivot = pivotAt.clone().add(face.clone().multiplyScalar(offset));
+  const doorH = Math.max(18, Math.max(...ats) - Math.min(...ats) + 12);
+  const doorW = 28;
+  const stile = kind === "barrel" ? 1.55 : 0.85;
+  const leaf = hot || pick ? "#e2a322" : kind === "leaf" ? "#2c2e31" : "#d5d8d4";
+  const pipe = "#b7bdb8";
+  const glow = pick ? "#e2a322" : "#000000";
+  const pickAt = (event: { stopPropagation: () => void }) => {
+    event.stopPropagation();
+    onPick();
+  };
+  return (
+    <group position={pivot} quaternion={quat} onClick={pickAt}>
+      {hinges.map((hinge) => {
+        const y = hinge.at - mid;
+        if (kind === "barrel") {
+          return (
+            <group key={hinge.id} position={[0, y, 0]}>
+              <mesh castShadow>
+                <cylinderGeometry args={[0.48, 0.48, 4, 18]} />
+                <meshStandardMaterial color={leaf} emissive={glow} emissiveIntensity={pick ? 0.7 : 0} metalness={0.72} roughness={0.32} />
+              </mesh>
+              <mesh>
+                <cylinderGeometry args={[0.5, 0.5, 0.08, 18]} />
+                <meshStandardMaterial color="#1c1e1c" emissive={glow} emissiveIntensity={pick ? 0.45 : 0} metalness={0.4} roughness={0.5} />
+              </mesh>
+              {shim ? (
+                <>
+                  <mesh position={[0, 1.15, 0]}>
+                    <cylinderGeometry args={[0.58, 0.58, 0.12, 18]} />
+                    <meshStandardMaterial color="#c4a574" metalness={0.45} roughness={0.4} />
+                  </mesh>
+                  <mesh position={[0, -1.15, 0]}>
+                    <cylinderGeometry args={[0.58, 0.58, 0.12, 18]} />
+                    <meshStandardMaterial color="#c4a574" metalness={0.45} roughness={0.4} />
+                  </mesh>
+                </>
+              ) : null}
+            </group>
+          );
+        }
+        return (
+          <group key={hinge.id} position={[0, y, 0]}>
+            <mesh position={[-0.38, 0, 0]} castShadow>
+              <boxGeometry args={[0.7, 1.35, 0.85]} />
+              <meshStandardMaterial color={leaf} emissive={glow} emissiveIntensity={pick ? 0.65 : 0} roughness={0.72} />
+            </mesh>
+            <mesh>
+              <cylinderGeometry args={[0.16, 0.16, 1.7, 12]} />
+              <meshStandardMaterial color="#8d9298" emissive={glow} emissiveIntensity={pick ? 0.4 : 0} metalness={0.8} roughness={0.3} />
+            </mesh>
+          </group>
+        );
+      })}
+      {pick ? (
+        <mesh onClick={pickAt}>
+          <cylinderGeometry args={[1.6, 1.6, Math.max(8, doorH), 12]} />
+          <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+        </mesh>
+      ) : null}
+      {showGate ? (
+      <group rotation={[0, (deg * Math.PI) / 180, 0]} onClick={pickAt}>
+        {kind === "leaf"
+          ? hinges.map((hinge) => (
+              <mesh key={`leaf-${hinge.id}`} position={[0.42, hinge.at - mid, 0]} castShadow>
+                <boxGeometry args={[0.7, 1.35, 0.85]} />
+                <meshStandardMaterial color={leaf} roughness={0.72} />
+              </mesh>
+            ))
+          : null}
+        <mesh position={[stile, 0, 0]} castShadow>
+          <cylinderGeometry args={[0.38, 0.38, doorH, 12]} />
+          <meshStandardMaterial color={pipe} metalness={0.55} roughness={0.38} />
+        </mesh>
+        <mesh position={[stile, 0, doorW]} castShadow>
+          <cylinderGeometry args={[0.38, 0.38, doorH, 12]} />
+          <meshStandardMaterial color={pipe} metalness={0.55} roughness={0.38} />
+        </mesh>
+        <mesh position={[stile, doorH / 2 - 1.5, doorW / 2]} rotation={[Math.PI / 2, 0, 0]} castShadow>
+          <cylinderGeometry args={[0.32, 0.32, doorW, 12]} />
+          <meshStandardMaterial color={pipe} metalness={0.55} roughness={0.38} />
+        </mesh>
+        <mesh position={[stile, -doorH / 2 + 1.5, doorW / 2]} rotation={[Math.PI / 2, 0, 0]} castShadow>
+          <cylinderGeometry args={[0.32, 0.32, doorW, 12]} />
+          <meshStandardMaterial color={pipe} metalness={0.55} roughness={0.38} />
+        </mesh>
+        <mesh position={[stile, 0, doorW / 2]}>
+          <boxGeometry args={[0.08, doorH - 3, doorW]} />
+          <meshStandardMaterial color="#efe6d6" transparent opacity={0.28} depthWrite={false} />
+        </mesh>
+      </group>
+      ) : null}
+    </group>
+  );
+}
+
+function AngleArm({
+  member,
+  hinge,
+  deg,
+  hot,
+  onPick,
+}: {
+  member: Member;
+  hinge: Hinge;
+  deg: number;
+  hot: boolean;
+  onPick: () => void;
+}) {
+  const { quat } = hingeBasis(member, hinge.side);
+  const at = pointOn(member, hinge.at);
+  const color = hot ? "#e2a322" : "#d7dbd6";
+  return (
+    <group position={at} quaternion={quat}>
+      <mesh castShadow>
+        <cylinderGeometry args={[0.55, 0.55, 1.15, 14]} />
+        <meshStandardMaterial color={color} metalness={0.7} roughness={0.32} />
+      </mesh>
+      <mesh position={[0.7, 0, 0]} rotation={[Math.PI / 2, 0, Math.PI / 2]}>
+        <cylinderGeometry args={[0.14, 0.14, 0.55, 10]} />
+        <meshStandardMaterial color="#8d9298" metalness={0.85} roughness={0.28} />
+      </mesh>
+      <group
+        rotation={[0, 0, (deg * Math.PI) / 180]}
+        onClick={(event) => {
+          event.stopPropagation();
+          onPick();
+        }}
+      >
+        <mesh position={[12, 0, 0]} rotation={[0, 0, Math.PI / 2]} castShadow>
+          <cylinderGeometry args={[0.4, 0.4, 22, 12]} />
+          <meshStandardMaterial color="#c9cdc6" metalness={0.55} roughness={0.36} />
+        </mesh>
+      </group>
+    </group>
+  );
+}
+
 export function Viewport({
   project,
   build,
@@ -1232,6 +1518,7 @@ export function Viewport({
   measure,
   onActivate,
   onPlace,
+  onTip,
   onClear,
   onMeasure,
   onMovePost,
@@ -1263,6 +1550,7 @@ export function Viewport({
   measure: { a: Vec3 | null; b: Vec3 | null };
   onActivate: (id: string, point?: [number, number, number]) => void;
   onPlace: (x: number, z: number) => void;
+  onTip: (x: number, z: number) => void;
   onClear: () => void;
   onMeasure: (point: Vec3) => void;
   onMovePost: (id: string, x: number, z: number) => void;
@@ -1283,6 +1571,17 @@ export function Viewport({
   loadCaps?: { id: string; color: string }[];
 }) {
   const present = false;
+  const showHingePreview = useShop((s) => s.showHingePreview);
+  const full = normalizeProject(project);
+  const posed = useMemo(() => poseSwung(full, build), [full, build]);
+  const viewBuild = useMemo(() => ({ ...build, members: posed.members, fittings: posed.fittings }), [build, posed]);
+  const doorHosts = useMemo(() => {
+    const ids = new Set<string>();
+    for (const hinge of build.hinges) if (hinge.kind !== "angle") ids.add(hinge.memberId);
+    return ids;
+  }, [build.hinges]);
+  const doorMembers = useMemo(() => new Set(full.doors.map((door) => door.memberId)), [full]);
+  const hingeMode = tool === "door" ? "pick" : tool === "hinge" || showHingePreview ? "preview" : "hidden";
   const trade = tradeById(project.trade);
   const colors =
     project.finish === "black"
@@ -1303,15 +1602,27 @@ export function Viewport({
   const distance = span * 0.78 + 26;
   const grid = Math.max(168, Math.ceil((span + 48) / 12) * 12);
   const [hover, setHover] = useState<{ x: number; z: number } | null>(null);
-  const ghost = hover && tool === "post" && project.mode === "sketch" ? snapSketch(hover.x, hover.z, nodes.filter((node) => !node.host)) : null;
+  const tipping = tool === "rail" && (draftLine?.length ?? 0) >= 1;
+  const posts = nodes.filter((node) => !node.host && !node.tip);
+  const rawGhost = hover && project.mode === "sketch" && (tool === "post" || tipping) ? snapSketch(hover.x, hover.z, posts) : null;
+  const ghost = (() => {
+    if (!rawGhost || !tipping) return rawGhost;
+    const draft = useShop.getState().draft;
+    const last = draft?.stops[draft.stops.length - 1];
+    const node = last ? nodes.find((item) => item.id === last.nodeId) : undefined;
+    if (!node) return rawGhost;
+    const squared = squareFrom(node, rawGhost.x, rawGhost.z);
+    return { ...rawGhost, ...squared, lockX: Math.abs(squared.x - node.x) < 0.2, lockZ: Math.abs(squared.z - node.z) < 0.2 };
+  })();
+  const tipY = draftLine && draftLine.length ? draftLine[draftLine.length - 1][1] : 0;
   const dragged = useRef(false);
   const beginDrag = useRef<(spec: DragSpec) => void>(() => {});
   const dragEnabled = false;
   const hinted = useMemo(() => {
     const ids = new Set<string>();
-    const sel = build.members.find((m) => m.id === selected);
+    const sel = viewBuild.members.find((m) => m.id === selected);
     if (!sel) return ids;
-    for (const member of build.members) {
+    for (const member of viewBuild.members) {
       if (member.id === sel.id) continue;
       if (sel.kind === "post" && member.kind === "post") {
         if (
@@ -1334,12 +1645,12 @@ export function Viewport({
       }
     }
     return ids;
-  }, [build.members, selected]);
+  }, [viewBuild.members, selected]);
   const guides = useMemo(() => {
-    const sel = build.members.find((m) => m.id === selected && m.kind === "post");
+    const sel = viewBuild.members.find((m) => m.id === selected && m.kind === "post");
     if (!sel) return [] as { key: string; points: [Vec3, Vec3] }[];
     const lines: { key: string; points: [Vec3, Vec3] }[] = [];
-    for (const member of build.members) {
+    for (const member of viewBuild.members) {
       if (member.kind !== "post" || member.id === sel.id) continue;
       if (Math.abs(member.a[0] - sel.a[0]) > 0.35 && Math.abs(member.a[2] - sel.a[2]) > 0.35) continue;
       lines.push({
@@ -1351,7 +1662,7 @@ export function Viewport({
       });
     }
     return lines;
-  }, [build.members, selected]);
+  }, [viewBuild.members, selected]);
   return (
     <Canvas
       className="scene"
@@ -1380,11 +1691,17 @@ export function Viewport({
         infiniteGrid={false}
       />
       {!present && (project.mode === "sketch" || tool === "measure") ? (
-        <Floor tool={tool} onPlace={onPlace} onClear={onClear} onHover={setHover} onPoint={onMeasure} />
+        <Floor tool={tool} tipping={tipping} onPlace={onPlace} onTip={onTip} onClear={onClear} onHover={setHover} onPoint={onMeasure} />
       ) : null}
-      {!present && ghost ? (
+      {!present && ghost && !tipping ? (
         <mesh position={[ghost.x, 0.06, ghost.z]} rotation={[-Math.PI / 2, 0, 0]}>
           <ringGeometry args={[1.1, 1.55, 28]} />
+          <meshBasicMaterial color="#e2a322" />
+        </mesh>
+      ) : null}
+      {!present && ghost && tipping ? (
+        <mesh position={[ghost.x, tipY, ghost.z]}>
+          <sphereGeometry args={[0.7, 14, 14]} />
           <meshBasicMaterial color="#e2a322" />
         </mesh>
       ) : null}
@@ -1413,7 +1730,7 @@ export function Viewport({
           beginDrag.current = start;
         }}
       />
-      {build.members.map((member) => {
+      {viewBuild.members.map((member) => {
         const strain = loadStrains.find((item) => item.id === member.id);
         return (
         <MemberMesh
@@ -1421,11 +1738,11 @@ export function Viewport({
           member={member}
           radius={tradeById(member.trade ?? project.trade).od / 2}
           colors={colors}
-          selected={!present && (selected === member.id || (anchor != null && member.id === `post:${anchor}`))}
+          selected={!present && (samePiece(selected, member.id) || (anchor != null && (member.id === `post:${anchor}` || member.id === `post:${anchor}:hi`)))}
           hinted={!present && hinted.has(member.id)}
-          glow={!present && picking && (member.kind === "post" || member.kind === "rail")}
+          glow={!present && (((picking || tool === "hinge") && (member.kind === "post" || member.kind === "rail")) || (tool === "door" && doorHosts.has(member.id)))}
           dragEnabled={!present && dragEnabled && member.id.includes(":") && !picking}
-          straps={build.straps.filter((strap) => strap.memberId === member.id)}
+          straps={viewBuild.straps.filter((strap) => strap.memberId === member.id)}
           strapGlow={!present && tool === "lumber"}
           present={present}
           black={project.finish === "black"}
@@ -1490,19 +1807,19 @@ export function Viewport({
         />
         );
       })}
-      <Measures members={build.members} show={showMeasures} unit={unit} />
-      {!present ? <NameTags project={project} build={build} show={showLabels} /> : null}
+      <Measures members={viewBuild.members} show={showMeasures} unit={unit} />
+      {!present ? <NameTags project={project} build={viewBuild} show={showLabels} /> : null}
       {!present ? <LeanArrows /> : null}
-      {!present ? <LumberArrows project={project} build={build} tool={tool} selected={selected} /> : null}
+      {!present ? <LumberArrows project={project} build={viewBuild} tool={tool} selected={selected} /> : null}
       {(showLumber ? (project.boards ?? []) : []).map((board) => (
         <BoardMesh
           key={board.id}
           board={board}
           ctx={{
-            fittings: build.fittings.map((item) => ({ id: item.id, sku: item.sku, position: item.position })),
-            members: build.members.map((item) => ({ id: item.id, a: item.a, b: item.b })),
+            fittings: viewBuild.fittings.map((item) => ({ id: item.id, sku: item.sku, position: item.position })),
+            members: viewBuild.members.map((item) => ({ id: item.id, a: item.a, b: item.b })),
             boards: project.boards ?? [],
-            straps: strapPoints(build.straps, build.members),
+            straps: strapPoints(viewBuild.straps, viewBuild.members),
             pipeRadius: trade.od / 2,
           }}
           selected={!present && selected === `board:${board.id}`}
@@ -1512,7 +1829,7 @@ export function Viewport({
           onPick={(point) => onActivate(`board:${board.id}`, point)}
         />
       ))}
-      {!present ? <LumberGhost project={project} build={build} tool={tool} /> : null}
+      {!present ? <LumberGhost project={project} build={viewBuild} tool={tool} /> : null}
       {!present && showMeasures && measure.a && measure.b ? (
         <group>
           <Line points={[measure.a, measure.b]} color="#e2a322" lineWidth={2} />
@@ -1538,7 +1855,17 @@ export function Viewport({
           </group>
         ))
         : null}
-      {build.fittings.map((fitting) => (
+      <HingeStage
+        members={build.members}
+        hinges={build.hinges}
+        swings={full.hingeSwing}
+        frameTrade={project.trade}
+        selected={selected}
+        doorMembers={doorMembers}
+        mode={hingeMode}
+        onPick={(id) => onActivate(id)}
+      />
+      {viewBuild.fittings.map((fitting) => (
         <FittingMesh
           key={fitting.id}
           fitting={fitting}

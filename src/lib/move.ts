@@ -79,7 +79,7 @@ function lift(node: SketchNode, y: number): boolean {
 }
 
 function crowded(nodes: SketchNode[]): boolean {
-  const posts = nodes.filter((node) => !node.host);
+  const posts = nodes.filter((node) => !node.host && !node.tip);
   for (let i = 0; i < posts.length; i++) {
     for (let j = i + 1; j < posts.length; j++) {
       if (Math.hypot(posts[i].x - posts[j].x, posts[i].z - posts[j].z) < 4) return true;
@@ -98,9 +98,13 @@ function linksFit(nodes: SketchNode[], links: SketchLink[]): boolean {
     if (span < (a.host || b.host ? 3 : 6)) return false;
     const [ya, yb] = endHeights(link);
     if (ya < 1 || yb < 1 || ya > 240 || yb > 240) return false;
-    if ((!a.host && ya > a.height + 0.05) || (!b.host && yb > b.height + 0.05)) return false;
+    if ((!a.host && !a.tip && ya > a.height + 0.05) || (!b.host && !b.tip && yb > b.height + 0.05)) return false;
   }
   for (const node of nodes) {
+    if (node.tip) {
+      if (node.height < 1 || node.height > 240) return false;
+      continue;
+    }
     if (node.host) {
       if (node.height < 1 || node.height > 240) return false;
       continue;
@@ -188,8 +192,10 @@ export function projectWithDelta(base: Project, target: MoveTarget, delta: MoveD
     links = links.map((item) => (item.id === link.id ? shiftBoth(item, delta.y) : item));
     const moved = links.find((item) => item.id === link.id)!;
     const [ya, yb] = endHeights(moved);
-    if (!a.host && !lift(a, ya)) return null;
-    if (!b.host && !lift(b, yb)) return null;
+    if (a.tip) a.height = r32(Math.min(240, Math.max(1, ya)));
+    else if (!a.host && !lift(a, ya)) return null;
+    if (b.tip) b.height = r32(Math.min(240, Math.max(1, yb)));
+    else if (!b.host && !lift(b, yb)) return null;
     return commitSketch(project, nodes, links);
   }
 
@@ -215,7 +221,8 @@ export function projectWithDelta(base: Project, target: MoveTarget, delta: MoveD
       const [ya, yb] = endHeights(link);
       return Math.max(max, link.a === node.id ? ya : 0, link.b === node.id ? yb : 0);
     }, 0);
-    if (!node.host && !lift(node, high)) return null;
+    if (!node.tip && !node.host && !lift(node, high)) return null;
+    if (node.tip) node.height = r32(Math.min(240, Math.max(1, high || node.height)));
   }
   return commitSketch(project, nodes, links);
 }

@@ -11,11 +11,14 @@ import {
   Redo2,
   Check,
   X,
+  Layers,
+  ChevronRight,
+  RotateCw,
 } from "lucide-react";
 import { Viewport } from "@/components/viewport";
 import { DesignPacket } from "@/components/packet";
-import { alignmentNotes, baysMatchingOutside, buildProject, colName, endHeights, fortyFiveButtons, MEASURE_REFERENCES, normalizeProject, previewRailRun, railRunError, stickName, strapWindow, withAxisCount, type Fitting, type MeasureRef, type Member, type PlannedClamp, type Project, type SketchLink, type SketchNode, type Strap } from "@/lib/build";
-import { CONNECTORS, STRAP_PACK_PRICE, TRADES, connectorPrice, tradeById } from "@/lib/catalog";
+import { alignmentNotes, baysMatchingOutside, buildProject, colName, endHeights, fortyFiveButtons, hingeOpenMax, hingeWindow, MEASURE_REFERENCES, normalizeProject, planAngle, postSplit, previewRailRun, railRunError, stickName, strapWindow, withAxisCount, type Door, type Fitting, type FullProject, type HingeKind, type MeasureRef, type Member, type PlannedClamp, type Plug, type Project, type SketchLink, type SketchNode, type Strap } from "@/lib/build";
+import { ANGLE_HINGE_PRICE, BARREL_OD, BARREL_PRICE, CONNECTORS, LEAF_SET_PRICE, ONE_SHIM_PRICE, SHIM_PRICE, STRAP_PACK_PRICE, STRAP_PRICE, TRADES, connectorPrice, tradeById } from "@/lib/catalog";
 import { formatDecimal, formatLen, money, parseLength } from "@/lib/format";
 import { WEIGHT_BANDS, rateLoads, rateCapacities, stationAlong, type ForceDir, type ShopLoad } from "@/lib/load";
 import { OSB_THICKNESS, STOCKS, STOCK_MAP, boardHang, boardTitle, canPlaceLumber, layoutBoard, strapPoints, type Board, type SlideAxis } from "@/lib/lumber";
@@ -139,15 +142,21 @@ const TOOLS: { id: Tool; label: string }[] = [
   { id: "select", label: "Select" },
   { id: "post", label: "Post" },
   { id: "rail", label: "Rail" },
+  { id: "hinge", label: "Hinge" },
+  { id: "door", label: "Door" },
   { id: "lumber", label: "Lumber" },
   { id: "erase", label: "Erase" },
   { id: "measure", label: "Measure" },
 ];
 
 function postNames(nodes: SketchNode[], links: SketchLink[] = []) {
-  const ordered = [...nodes].filter((node) => !node.host).sort((a, b) => a.z - b.z || a.x - b.x);
+  const ordered = [...nodes].filter((node) => !node.host && !node.tip).sort((a, b) => a.z - b.z || a.x - b.x);
   const names = new Map(ordered.map((node, i) => [node.id, colName(i)]));
   for (const node of nodes) {
+    if (node.tip) {
+      names.set(node.id, "open end");
+      continue;
+    }
     if (!node.host) continue;
     const link = links.find((item) => item.id === node.host);
     const a = link ? names.get(link.a) : undefined;
@@ -160,9 +169,10 @@ function postNames(nodes: SketchNode[], links: SketchLink[] = []) {
 function pipeTitle(link: SketchLink, nodes: SketchNode[], names: Map<string, string>) {
   const a = nodes.find((node) => node.id === link.a);
   const b = nodes.find((node) => node.id === link.b);
-  const left = names.get(link.a) ?? "?";
-  const right = names.get(link.b) ?? "?";
+  const left = a?.tip ? "open end" : (names.get(link.a) ?? "?");
+  const right = b?.tip ? "open end" : (names.get(link.b) ?? "?");
   if (a?.host || b?.host) return `Brace ${left} to ${right}`;
+  if (a?.tip || b?.tip) return `Rail ${left === "open end" ? right : left}`;
   return `${link.kind === "brace" ? "Brace" : "Rail"} ${left}–${right}`;
 }
 
@@ -184,18 +194,28 @@ function FreeBuild({ unit }: { unit: "in" | "ft" }) {
   const activeId = useShop((s) => s.activeId);
   const project = normalizeProject(projects.find((p) => p.id === activeId) ?? projects[0]);
   const names = postNames(project.nodes, project.links);
-  const node = project.nodes.find((n) => selectedId === `post:${n.id}`) ?? project.nodes.find((n) => n.id === anchor) ?? null;
-  const link = project.links.find((l) => selectedId === `rail:${l.id}` || selectedId === `brace:${l.id}`) ?? null;
+  const node = project.nodes.find((n) => selectedId === `post:${n.id}` || selectedId === `post:${n.id}:hi`) ?? project.nodes.find((n) => n.id === anchor) ?? null;
+  const link =
+    project.links.find((l) => {
+      if (!selectedId) return false;
+      const prefix = l.kind === "brace" ? "brace:" : "rail:";
+      if (!selectedId.startsWith(prefix)) return false;
+      return selectedId.slice(prefix.length).replace(/:stub[AB]$/, "") === l.id;
+    }) ?? null;
   const hint =
     tool === "post"
       ? "Click the floor. Posts snap to the inch, and onto another post’s line when you’re close."
       : tool === "rail"
-        ? "Click posts or the middle of a rail, in order. A run can visit as many as you need, then close back on the first post."
-        : tool === "erase"
+        ? "Click posts or the middle of a rail, in order. After the first post, click the floor to leave the other end open. That end lands square — turn it after."
+        : tool === "hinge"
+          ? "Click a post or a rail. Set how many hinges, then how far from each end. Swing previews the motion. Door hangs a real frame."
+          : tool === "door"
+            ? "Click a glowing hinge. Set how wide the door is, then place it. The frame is real pipe, and lumber on it swings too."
+          : tool === "erase"
           ? "Click a post to remove it and its pipes, or a rail to delete just that pipe."
           : tool === "measure"
             ? "Click two points. The line stays until you start another one."
-            : "Select a post or rail. Move and resize happen on its card, not on the click.";
+            : "Select a post or rail. Where two pipes meet, the card asks which one is cut.";
 
   return (
     <section className="measure-card">
@@ -265,6 +285,7 @@ function FreeBuild({ unit }: { unit: "in" | "ft" }) {
             <input type="checkbox" checked={node.flange} onChange={(e) => patchNode(node.id, { flange: e.target.checked })} />
             Floor flange on this post
           </label>
+          <PostExtras node={node} unit={unit} />
           <DeleteButton name="post" onDelete={() => removeNode(node.id)} />
         </div>
       ) : null}
@@ -281,7 +302,12 @@ function FreeBuild({ unit }: { unit: "in" | "ft" }) {
                 unit={unit}
                 min={1}
                 max={240}
-                onCommit={(y) => update({ links: project.links.map((item) => (item.id === link.id ? { ...item, y } : item)) })}
+                onCommit={(y) =>
+                  update({
+                    nodes: slideSplits(project, link, y, endHeights(link)[1]),
+                    links: project.links.map((item) => (item.id === link.id ? { ...item, y } : item)),
+                  })
+                }
               />
               <LenField
                 label={`At ${names.get(link.b)}`}
@@ -289,7 +315,12 @@ function FreeBuild({ unit }: { unit: "in" | "ft" }) {
                 unit={unit}
                 min={1}
                 max={240}
-                onCommit={(yB) => update({ links: project.links.map((item) => (item.id === link.id ? { ...item, yB } : item)) })}
+                onCommit={(yB) =>
+                  update({
+                    nodes: slideSplits(project, link, endHeights(link)[0], yB),
+                    links: project.links.map((item) => (item.id === link.id ? { ...item, yB } : item)),
+                  })
+                }
               />
               <p className="fine">
                 {Math.abs(endHeights(link)[0] - endHeights(link)[1]) > 1 / 16
@@ -339,6 +370,7 @@ function FreeBuild({ unit }: { unit: "in" | "ft" }) {
       {project.nodes.length === 0 ? <p className="fine">None yet.</p> : null}
       <ul className="member-list">
         {project.nodes
+          .filter((item) => !item.tip)
           .slice()
           .sort((a, b) => (names.get(a.id) ?? "").localeCompare(names.get(b.id) ?? ""))
           .map((item) => (
@@ -539,7 +571,15 @@ function BarEditor({
       <BarModes mode={mode} onChange={onMode} />
       {mode === "resize" ? (
         <>
-          <LenField label="Center to center" inches={span} unit={unit} min={6} max={360} onCommit={onResize} />
+          <div className="nudge">
+            <button type="button" className="btn" aria-label="Shorter rail" disabled={span <= 6} onClick={() => onResize(Math.max(6, span - 1))}>
+              <Minus size={16} />
+            </button>
+            <LenField label="Center to center" inches={span} unit={unit} min={6} max={360} onCommit={onResize} />
+            <button type="button" className="btn" aria-label="Longer rail" disabled={span >= 360} onClick={() => onResize(Math.min(360, span + 1))}>
+              <Plus size={16} />
+            </button>
+          </div>
           <div className="bay-row">
             {a.host ? (
               <HostOffset nodeId={a.id} unit={unit} />
@@ -567,13 +607,78 @@ function BarEditor({
             )}
           </div>
           <p className="fine">
-            Length slides post {nameB}. Different end heights pivot the bar on a hinge. Drag the bar to change the length.
+            {b.tip
+              ? "Length slides the open end. That end is not a post."
+              : `Length slides post ${nameB}. Different end heights pivot the bar on a hinge. Drag the bar to change the length.`}
           </p>
+          <RailTurn link={link} a={a} b={b} />
         </>
       ) : (
         <MoveControl target={{ kind: "bar", id: link.id }} unit={unit} />
       )}
     </>
+  );
+}
+
+function RailTurn({ link, a, b }: { link: SketchLink; a: SketchNode; b: SketchNode }) {
+  const rotateBar = useShop((s) => s.rotateBar);
+  const [text, setText] = useState<string | null>(null);
+  const span = Math.hypot(b.x - a.x, b.z - a.z);
+  const shown = Math.round(planAngle(a, b)) % 360;
+  const blocked = Boolean(a.host || b.host);
+  const turn = (deg: number) => rotateBar(link.id, ((deg % 360) + 360) % 360);
+  const commit = (raw: string) => {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return;
+    turn(n);
+  };
+  return (
+    <div data-testid="rail-turn">
+      <p className="fine">Turn this rail</p>
+      {blocked ? (
+        <p className="fine">This end is a joint on another rail, so the pipe cannot swing.</p>
+      ) : (
+        <>
+          <div className="nudge">
+            <button type="button" className="btn" aria-label="Turn left 5 degrees" disabled={span < 1} onClick={() => turn(shown - 5)}>
+              <RotateCcw size={16} />
+            </button>
+            <label className="field">
+              <span>Degrees</span>
+              <input
+                data-testid="rail-degrees"
+                type="text"
+                inputMode="numeric"
+                aria-label="Degrees"
+                value={text ?? String(shown)}
+                onFocus={(e) => {
+                  setText(String(shown));
+                  e.currentTarget.select();
+                }}
+                onChange={(e) => setText(e.target.value)}
+                onBlur={() => {
+                  const raw = text;
+                  setText(null);
+                  if (raw != null) commit(raw);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") e.currentTarget.blur();
+                }}
+              />
+            </label>
+            <button type="button" className="btn" aria-label="Turn right 5 degrees" disabled={span < 1} onClick={() => turn(shown + 5)}>
+              <RotateCw size={16} />
+            </button>
+          </div>
+          <button type="button" className="btn" disabled={span < 1} onClick={() => turn(Math.round(shown / 90) * 90)}>
+            Square it
+          </button>
+          <p className="fine">
+            A new open end lands square, on the inch. These arrows turn it after that. 0° runs along the width. 90° runs along the depth. The far end swings and the length stays.
+          </p>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -605,6 +710,8 @@ function GridRailEditor({
         <>
           <LenField label="This bay" inches={bay ?? member.span} unit={unit} min={4} max={360} onCommit={(length) => onBay(axis, index, length)} />
           <p className="fine">Changes the center-to-center length of this bay. The other bays stay.</p>
+          <p className="fine">A new rail is square. To turn one at an angle, choose Edit these posts freely, select the rail, and use the turn arrows.</p>
+          <p className="fine">This rail stops in a saddle at each post. To cut the post or the rail where they meet, choose Edit these posts freely.</p>
         </>
       ) : (
         <>
@@ -1054,6 +1161,704 @@ function WoodStraps({ member, straps, unit }: { member: Member; straps: Strap[];
   );
 }
 
+function round32(n: number): number {
+  return Math.round(n * 32) / 32;
+}
+
+function endNode(link: SketchLink, end: "a" | "b", nodes: SketchNode[]): SketchNode | undefined {
+  return nodes.find((node) => node.id === (end === "a" ? link.a : link.b));
+}
+
+function squareJoint(a: SketchNode, b: SketchNode, ya: number, yb: number): boolean {
+  if (Math.abs(ya - yb) > 1 / 16) return false;
+  const dx = b.x - a.x;
+  const dz = b.z - a.z;
+  return (Math.abs(dz) <= 0.35 && Math.abs(dx) > 0.35) || (Math.abs(dx) <= 0.35 && Math.abs(dz) > 0.35);
+}
+
+function jointChoice(link: SketchLink, end: "a" | "b", node: SketchNode, y: number): "vertical" | "horizontal" | null {
+  const cut = end === "a" ? link.cutA : link.cutB;
+  if (cut === "horizontal") return "horizontal";
+  if (cut === "vertical") return "vertical";
+  const split = postSplit(node);
+  if (split != null && Math.abs(y - split) <= 0.75) return "vertical";
+  return null;
+}
+
+function setCut(row: SketchLink, which: "a" | "b", cut: "vertical" | "horizontal" | undefined) {
+  if (which === "a") row.cutA = cut;
+  else row.cutB = cut;
+}
+
+function setPast(row: SketchLink, which: "a" | "b", past: number | undefined) {
+  if (which === "a") row.pastA = past;
+  else row.pastB = past;
+}
+
+function cutAt(row: SketchLink, which: "a" | "b") {
+  return which === "a" ? row.cutA : row.cutB;
+}
+
+function yAt(row: SketchLink, which: "a" | "b") {
+  return endHeights(row)[which === "a" ? 0 : 1];
+}
+
+function writeJoint(
+  project: { nodes: SketchNode[]; links: SketchLink[] },
+  update: (patch: Partial<Project>) => void,
+  link: SketchLink,
+  end: "a" | "b",
+  next: "vertical" | "horizontal",
+) {
+  const node = endNode(link, end, project.nodes);
+  if (!node || node.tip || node.host) return;
+  const y = yAt(link, end);
+  const current = jointChoice(link, end, node, y);
+  const choice = next === current ? null : next;
+  const nodes = project.nodes.map((item) => ({ ...item }));
+  const links = project.links.map((item) => ({ ...item }));
+  const linkRow = links.find((item) => item.id === link.id);
+  const nodeRow = nodes.find((item) => item.id === node.id);
+  if (!linkRow || !nodeRow) return;
+  if (choice == null) {
+    setCut(linkRow, end, undefined);
+    if (current === "vertical" && typeof nodeRow.split === "number" && Math.abs(nodeRow.split - y) <= 0.75) {
+      nodeRow.split = undefined;
+      for (const other of links) {
+        for (const which of ["a", "b"] as const) {
+          if ((which === "a" ? other.a : other.b) !== node.id) continue;
+          if (cutAt(other, which) === "vertical" && Math.abs(yAt(other, which) - y) <= 0.75) setCut(other, which, undefined);
+        }
+      }
+    }
+  } else if (choice === "vertical") {
+    if (nodeRow.height - y < 6) nodeRow.height = Math.min(240, y + 6);
+    if (nodeRow.height - y < 2) nodeRow.height = Math.min(240, y + 2);
+    nodeRow.height = round32(Math.max(12, nodeRow.height));
+    nodeRow.split = round32(Math.min(nodeRow.height - 1.05, Math.max(1.05, y)));
+    setCut(linkRow, end, "vertical");
+    setPast(linkRow, end, undefined);
+    for (const other of links) {
+      if (other.id === link.id) continue;
+      for (const which of ["a", "b"] as const) {
+        if ((which === "a" ? other.a : other.b) !== node.id) continue;
+        const near = Math.abs(yAt(other, which) - (nodeRow.split as number)) <= 0.75;
+        const oc = cutAt(other, which);
+        if ((oc === "horizontal" && near) || (oc === "vertical" && !near)) setCut(other, which, undefined);
+      }
+    }
+  } else {
+    const past = end === "a" ? (linkRow.pastA ?? 0) : (linkRow.pastB ?? 0);
+    setCut(linkRow, end, "horizontal");
+    if (past <= 2) setPast(linkRow, end, 6);
+    for (const other of links) {
+      for (const which of ["a", "b"] as const) {
+        if (other.id === link.id && which === end) continue;
+        if ((which === "a" ? other.a : other.b) !== node.id) continue;
+        if (cutAt(other, which) === "vertical" && Math.abs(yAt(other, which) - y) <= 0.75) setCut(other, which, undefined);
+      }
+    }
+    if (typeof nodeRow.split === "number" && Math.abs(nodeRow.split - y) <= 0.75) nodeRow.split = undefined;
+  }
+  update({ nodes, links });
+}
+
+function writeReach(
+  project: { nodes: SketchNode[]; links: SketchLink[] },
+  update: (patch: Partial<Project>) => void,
+  link: SketchLink,
+  end: "a" | "b",
+  kind: "above" | "past",
+  inches: number,
+) {
+  const node = endNode(link, end, project.nodes);
+  if (!node) return;
+  const y = yAt(link, end);
+  if (kind === "above") {
+    const above = Math.min(Math.max(0, 240 - y), Math.max(2, inches));
+    const height = round32(Math.min(240, Math.max(12, y + above)));
+    const split = round32(Math.min(height - 1.05, Math.max(1.05, y)));
+    update({
+      nodes: project.nodes.map((item) => (item.id === node.id ? { ...item, height, split } : item)),
+    });
+    return;
+  }
+  const choice = jointChoice(link, end, node, y);
+  const min = choice === "horizontal" ? 2 : 0;
+  const past = round32(Math.min(96, Math.max(min, inches)));
+  const pastKey = end === "a" ? "pastA" : "pastB";
+  const capKey = end === "a" ? "capA" : "capB";
+  update({
+    links: project.links.map((item) =>
+      item.id === link.id
+        ? {
+            ...item,
+            [pastKey]: past > 0.05 ? past : undefined,
+            [capKey]: past > 0.05 ? item[capKey] : undefined,
+          }
+        : item,
+    ),
+  });
+}
+
+function slideSplits(project: { nodes: SketchNode[]; links: SketchLink[] }, link: SketchLink, y: number, yB: number): SketchNode[] {
+  const [oldA, oldB] = endHeights(link);
+  return project.nodes.map((node) => {
+    if (node.tip || node.host) return node;
+    let height = node.height;
+    let split = node.split;
+    const apply = (which: "a" | "b", oldY: number, nextY: number) => {
+      if ((which === "a" ? link.a : link.b) !== node.id) return;
+      const cut = which === "a" ? link.cutA : link.cutB;
+      if (cut === "horizontal") return;
+      const near = typeof split === "number" && Math.abs(split - oldY) <= 0.75;
+      if (cut !== "vertical" && !near) return;
+      const next = round32(Math.max(1.05, nextY));
+      split = next;
+      if (height < next + 2) height = Math.min(240, round32(next + 6));
+    };
+    apply("a", oldA, y);
+    apply("b", oldB, yB);
+    if (split === node.split && height === node.height) return node;
+    return { ...node, height, split };
+  });
+}
+
+function Nudge({
+  label,
+  inches,
+  unit,
+  min,
+  max,
+  onCommit,
+}: {
+  label: string;
+  inches: number;
+  unit: "in" | "ft";
+  min: number;
+  max: number;
+  onCommit: (n: number) => void;
+}) {
+  const step = (dir: -1 | 1) => {
+    const next = Math.min(max, Math.max(min, Math.round((inches + dir) * 32) / 32));
+    if (Math.abs(next - inches) < 1 / 64) return;
+    onCommit(next);
+  };
+  return (
+    <div className="nudge">
+      <button type="button" className="btn" aria-label={`Shorter ${label}`} disabled={inches <= min + 1 / 64} onClick={() => step(-1)}>
+        <Minus size={16} />
+      </button>
+      <LenField label={label} inches={inches} unit={unit} min={min} max={max} onCommit={onCommit} />
+      <button type="button" className="btn" aria-label={`Longer ${label}`} disabled={inches >= max - 1 / 64} onClick={() => step(1)}>
+        <Plus size={16} />
+      </button>
+    </div>
+  );
+}
+
+function Crossing({
+  project,
+  link,
+  end,
+  unit,
+}: {
+  project: { nodes: SketchNode[]; links: SketchLink[] };
+  link: SketchLink;
+  end: "a" | "b";
+  unit: "in" | "ft";
+}) {
+  const update = useShop((s) => s.update);
+  const patchLink = useShop((s) => s.patchLink);
+  const node = endNode(link, end, project.nodes);
+  const other = endNode(link, end === "a" ? "b" : "a", project.nodes);
+  if (!node || !other || node.tip || node.host) return null;
+  const y = yAt(link, end);
+  const oy = yAt(link, end === "a" ? "b" : "a");
+  if (!squareJoint(node, other, y, oy)) return null;
+  const names = postNames(project.nodes, project.links);
+  const name = names.get(node.id) ?? "?";
+  const otherName = other.tip ? "the open end" : (names.get(other.id) ?? "?");
+  const choice = jointChoice(link, end, node, y);
+  const past = end === "a" ? (link.pastA ?? 0) : (link.pastB ?? 0);
+  const capped = end === "a" ? link.capA === true : link.capB === true;
+  const capKey = end === "a" ? "capA" : "capB";
+  const above = Math.max(0, node.height - y);
+  return (
+    <div className="joint">
+      <p className="fine">
+        At post {name}, on the rail to {otherName}. Which pipe is cut in two?
+      </p>
+      <div className="seg joint-pick" role="group" aria-label={`Which pipe is cut at post ${name}`}>
+        <button type="button" className={choice === "vertical" ? "on" : ""} onClick={() => writeJoint(project, update, link, end, "vertical")}>
+          Vertical
+        </button>
+        <button type="button" className={choice === "horizontal" ? "on" : ""} onClick={() => writeJoint(project, update, link, end, "horizontal")}>
+          Horizontal
+        </button>
+      </div>
+      {choice === "vertical" ? (
+        <>
+          <p className="fine">The rail runs through. The post is two cuts.</p>
+          <Nudge
+            label="Post above the rail"
+            inches={above}
+            unit={unit}
+            min={2}
+            max={Math.max(2, 240 - y)}
+            onCommit={(n) => writeReach(project, update, link, end, "above", n)}
+          />
+          <Nudge
+            label="Rail past the post"
+            inches={past}
+            unit={unit}
+            min={0}
+            max={96}
+            onCommit={(n) => writeReach(project, update, link, end, "past", n)}
+          />
+          <p className="fine">Above is the upper post. Past is how far the rail sticks out. The PDF uses both.</p>
+        </>
+      ) : choice === "horizontal" ? (
+        <>
+          <p className="fine">The post runs through. The rail is two cuts. A third pipe here becomes a 4-way.</p>
+          <Nudge
+            label="Rail past the post"
+            inches={past}
+            unit={unit}
+            min={2}
+            max={96}
+            onCommit={(n) => writeReach(project, update, link, end, "past", n)}
+          />
+          <p className="fine">That length is its own piece on the cut list.</p>
+        </>
+      ) : (
+        <p className="fine">Neither is cut. The rail stops in the saddle.</p>
+      )}
+      {choice == null && past > 0.05 ? <p className="fine">The stick-out at post {name} is ignored until one pipe is cut.</p> : null}
+      {(choice === "horizontal" && past > 0.05) || (choice === "vertical" && past > 0.05) ? (
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={capped}
+            onChange={(e) => patchLink(link.id, { [capKey]: e.target.checked ? true : undefined })}
+          />
+          End cap on that tip
+        </label>
+      ) : null}
+    </div>
+  );
+}
+
+function PostExtras({ node, unit }: { node: SketchNode; unit: "in" | "ft" }) {
+  const patchNode = useShop((s) => s.patchNode);
+  const projects = useShop((s) => s.projects);
+  const activeId = useShop((s) => s.activeId);
+  if (node.tip || node.host) return null;
+  const project = normalizeProject(projects.find((item) => item.id === activeId) ?? projects[0]);
+  const rails = project.links.filter((link) => link.a === node.id || link.b === node.id);
+  return (
+    <>
+      {rails.map((link) => (
+        <Crossing key={`${link.id}:${link.a === node.id ? "a" : "b"}`} project={project} link={link} end={link.a === node.id ? "a" : "b"} unit={unit} />
+      ))}
+      {rails.length === 0 ? <p className="fine">Join a rail to this post, then choose which pipe is cut.</p> : null}
+      <label className="check">
+        <input type="checkbox" data-testid="cap-top" checked={node.cap === true} onChange={(e) => patchNode(node.id, { cap: e.target.checked ? true : undefined })} />
+        End cap on top
+      </label>
+      {node.door ? (
+        <p className="fine">This stile starts above the floor. The hinges hold it, so the bottom is open.</p>
+      ) : !node.flange && (node.bury ?? 0) < 0.05 ? (
+        <label className="check">
+          <input
+            type="checkbox"
+            data-testid="cap-foot"
+            checked={node.capFoot === true}
+            onChange={(e) => patchNode(node.id, { capFoot: e.target.checked ? true : undefined })}
+          />
+          End cap on the bottom
+        </label>
+      ) : (
+        <p className="fine">{node.flange ? "The flange covers the bottom." : "A buried post has no cap on the foot."}</p>
+      )}
+    </>
+  );
+}
+
+function RailEnds({ link, unit }: { link: SketchLink; unit: "in" | "ft" }) {
+  const patchLink = useShop((s) => s.patchLink);
+  const projects = useShop((s) => s.projects);
+  const activeId = useShop((s) => s.activeId);
+  const project = normalizeProject(projects.find((item) => item.id === activeId) ?? projects[0]);
+  const fresh = project.links.find((item) => item.id === link.id) ?? link;
+  const a = project.nodes.find((node) => node.id === fresh.a);
+  const b = project.nodes.find((node) => node.id === fresh.b);
+  const cap = (which: "a" | "b", node: SketchNode | undefined) => {
+    if (!node?.tip) return null;
+    const capKey = which === "a" ? "capA" : "capB";
+    const capped = which === "a" ? fresh.capA === true : fresh.capB === true;
+    return (
+      <label key={which} className="check">
+        <input type="checkbox" checked={capped} onChange={(e) => patchLink(fresh.id, { [capKey]: e.target.checked ? true : undefined })} />
+        End cap on the open end
+      </label>
+    );
+  };
+  return (
+    <>
+      {cap("a", a)}
+      {a && !a.tip && !a.host ? <Crossing project={project} link={fresh} end="a" unit={unit} /> : null}
+      {cap("b", b)}
+      {b && !b.tip && !b.host ? <Crossing project={project} link={fresh} end="b" unit={unit} /> : null}
+    </>
+  );
+}
+
+function GridCaps({ memberId }: { memberId: string }) {
+  const projects = useShop((s) => s.projects);
+  const activeId = useShop((s) => s.activeId);
+  const update = useShop((s) => s.update);
+  const project = normalizeProject(projects.find((item) => item.id === activeId) ?? projects[0]);
+  const plug = (project.plugs ?? []).find((item) => item.id === memberId);
+  const write = (top: boolean, foot: boolean) => {
+    const rest = (project.plugs ?? []).filter((item) => item.id !== memberId);
+    const next: Plug[] = top || foot ? [...rest, { id: memberId, top: top || undefined, foot: foot || undefined }] : rest;
+    update({ plugs: next });
+  };
+  return (
+    <>
+      <label className="check">
+        <input type="checkbox" checked={plug?.top === true} onChange={(e) => write(e.target.checked, plug?.foot === true && !project.flanges)} />
+        End cap on top
+      </label>
+      {!project.flanges ? (
+        <label className="check">
+          <input type="checkbox" checked={plug?.foot === true} onChange={(e) => write(plug?.top === true, e.target.checked)} />
+          End cap on the bottom
+        </label>
+      ) : (
+        <p className="fine">The flange covers the bottom.</p>
+      )}
+      <p className="fine">End caps show on the buy list and the PDF. They do not change the cut.</p>
+    </>
+  );
+}
+
+function HingeCard({ unit, member }: { unit: "in" | "ft"; member: Member }) {
+  const projects = useShop((s) => s.projects);
+  const activeId = useShop((s) => s.activeId);
+  const setHingeCount = useShop((s) => s.setHingeCount);
+  const moveHinge = useShop((s) => s.moveHinge);
+  const setHingeKind = useShop((s) => s.setHingeKind);
+  const setHingeSide = useShop((s) => s.setHingeSide);
+  const setHingeSwing = useShop((s) => s.setHingeSwing);
+  const select = useShop((s) => s.select);
+  const project = normalizeProject(projects.find((p) => p.id === activeId) ?? projects[0]);
+  const [tab, setTab] = useState<"place" | "swing">("place");
+  const [draftKind, setDraftKind] = useState<HingeKind>("leaf");
+  const [draftSide, setDraftSide] = useState<1 | -1>(1);
+  const mine = project.hinges.filter((hinge) => hinge.memberId === member.id).sort((a, b) => a.at - b.at);
+  const kind = mine[0]?.kind ?? draftKind;
+  const side = mine[0]?.side ?? draftSide;
+  const [lo, hi] = hingeWindow(member, kind);
+  const span = Math.max(member.span, lo);
+  const fromStart = member.kind === "post" ? "the floor" : "this end";
+  const fromEnd = member.kind === "post" ? "the top" : "the other end";
+  const swing = project.hingeSwing.find((item) => item.memberId === member.id)?.deg ?? 0;
+  const max = hingeOpenMax(kind);
+  const pipe = member.trade ?? project.trade;
+  const pickKind = (next: HingeKind) => {
+    setDraftKind(next);
+    if (mine.length) {
+      const [nextLo, nextHi] = hingeWindow(member, next);
+      setHingeKind(member.id, next, nextLo, nextHi);
+    }
+  };
+  const pickSide = (next: 1 | -1) => {
+    setDraftSide(next);
+    if (mine.length) setHingeSide(member.id, next);
+  };
+  return (
+    <div className="float-card" data-testid="hinge-card">
+      <div className="card-head">
+        <h2>{member.kind === "post" ? "Hinge on this post" : "Hinge on this rail"}</h2>
+        <Confirm onConfirm={() => select(null)} />
+      </div>
+      <div className="bar-modes" role="tablist" aria-label="Hinge settings">
+        <button type="button" className={tab === "place" ? "on" : ""} onClick={() => setTab("place")}>
+          Place
+        </button>
+        <button type="button" className={tab === "swing" ? "on" : ""} data-testid="hinge-swing-tab" onClick={() => setTab("swing")}>
+          Swing
+        </button>
+      </div>
+      {tab === "swing" ? (
+        mine.length === 0 ? (
+          <p className="fine">Add a hinge on the Place tab first. Then this tab swings the door.</p>
+        ) : (
+          <div className="swing">
+            <p className="fine">{swing < 1 ? "Shut." : `Open ${Math.round(swing)}°.`}</p>
+            <input
+              data-testid="hinge-swing"
+              type="range"
+              min={0}
+              max={max}
+              step={1}
+              value={Math.min(max, swing)}
+              aria-label="How far the door is open"
+              onChange={(e) => setHingeSwing(member.id, Number(e.target.value))}
+            />
+            <div className="lean-end" role="group" aria-label="Swing the door">
+              <button type="button" className="btn" onClick={() => setHingeSwing(member.id, 0)}>
+                Shut
+              </button>
+              <button type="button" className="btn" aria-label="Close 15 degrees" onClick={() => setHingeSwing(member.id, swing - 15)}>
+                Close
+              </button>
+              <button type="button" className="btn" aria-label="Open 15 degrees" onClick={() => setHingeSwing(member.id, swing + 15)}>
+                Open
+              </button>
+              <button type="button" className="btn" onClick={() => setHingeSwing(member.id, max)}>
+                Wide
+              </button>
+            </div>
+            <p className="fine">
+              {project.doors.some((door) => door.memberId === member.id)
+                ? "This opens the door. The frame is real pipe, and lumber strapped to it swings with it."
+                : kind === "angle"
+                  ? "This hinge folds a pipe up to 90°. It is not a gate. The preview arm is not extra conduit."
+                  : "The pale gate is a preview so you can see the swing. It is not extra pipe and it is not on the cut list. It hides when you leave Hinge, unless Hinge ghosts is on under View."}
+            </p>
+          </div>
+        )
+      ) : (
+        <>
+          <div className="seg hinge-kind" role="group" aria-label="Hinge type">
+            <button type="button" className={kind === "leaf" ? "on" : ""} onClick={() => pickKind("leaf")}>
+              Offset
+            </button>
+            <button type="button" className={kind === "barrel" ? "on" : ""} onClick={() => pickKind("barrel")}>
+              Barrel
+            </button>
+            <button type="button" className={kind === "angle" ? "on" : ""} onClick={() => pickKind("angle")}>
+              Angle
+            </button>
+          </div>
+          <p className="fine">{hingeBlurb(kind, pipe)}</p>
+          <div className="count-row">
+            <button
+              type="button"
+              className="icon-btn"
+              aria-label="Fewer hinges"
+              disabled={mine.length === 0}
+              onClick={() => setHingeCount(member.id, mine.length - 1, lo, hi, kind, side)}
+            >
+              <Minus size={16} />
+            </button>
+            <strong>{mine.length}</strong>
+            <span>on this pipe</span>
+            <button
+              type="button"
+              className="icon-btn"
+              data-testid="hinge-add"
+              aria-label="More hinges"
+              disabled={mine.length >= 6}
+              onClick={() => setHingeCount(member.id, mine.length + 1, lo, hi, kind, side)}
+            >
+              <Plus size={16} />
+            </button>
+          </div>
+          <p className="fine">Same idea as straps. Choose how many, then set each one from {fromStart} or from {fromEnd}. A door usually wants two.</p>
+          {kind === "barrel" ? (
+            <p className="fine">A barrel spins on the pipe, so the face does not move the knuckle. Use Swing to open the gate.</p>
+          ) : (
+            <div className="seg" role="group" aria-label="Which face the hinge is on">
+              <button type="button" className={side === 1 ? "on" : ""} onClick={() => pickSide(1)}>
+                This face
+              </button>
+              <button type="button" className={side === -1 ? "on" : ""} onClick={() => pickSide(-1)}>
+                Other face
+              </button>
+            </div>
+          )}
+          {kind !== "barrel" ? (
+            <p className="fine">
+              {kind === "leaf"
+                ? "The offset hinge sits beside the pipe. The other face puts the knuckle on the opposite side, so the door opens the other way."
+                : "The angle hinge folds up to 90° either way. The other face is the other way."}
+            </p>
+          ) : null}
+          {mine.map((hinge, index) => (
+            <div key={hinge.id} className="hinge-seat">
+              <div className="bay-row">
+                <LenField
+                  label={`${index + 1} from ${fromStart}`}
+                  inches={hinge.at}
+                  unit={unit}
+                  min={lo}
+                  max={Math.max(lo, hi)}
+                  onCommit={(at) => moveHinge(hinge.id, at, lo, hi)}
+                />
+                <LenField
+                  label={`From ${fromEnd}`}
+                  inches={Math.max(0, span - hinge.at)}
+                  unit={unit}
+                  min={0}
+                  max={span}
+                  onCommit={(fromFar) => moveHinge(hinge.id, span - fromFar, lo, hi)}
+                />
+              </div>
+              <div className="lean-end" role="group" aria-label={`Slide hinge ${index + 1}`}>
+                <button type="button" className="btn" aria-label="Move hinge toward the start" onClick={() => moveHinge(hinge.id, hinge.at - 1, lo, hi)}>
+                  {member.kind === "post" ? "↓" : "←"}
+                </button>
+                <button type="button" className="btn" aria-label="Move hinge toward the end" onClick={() => moveHinge(hinge.id, hinge.at + 1, lo, hi)}>
+                  {member.kind === "post" ? "↑" : "→"}
+                </button>
+              </div>
+            </div>
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+function hingeBlurb(kind: HingeKind, pipe: "half" | "three-quarter" | "one"): string {
+  if (kind === "leaf") {
+    return pipe === "half"
+      ? `MakerPipe's EMT hinge set is ${money(LEAF_SET_PRICE)} for two hinges. It is sold for 3/4" and 1" only, not 1/2".`
+      : `EMT hinge set, ${money(LEAF_SET_PRICE)} for two. The knuckle is offset. Drill a 1/4" hole and bolt it to the pipe.`;
+  }
+  if (kind === "barrel") {
+    return pipe === "one"
+      ? `Barrel hinge, ${money(BARREL_PRICE)}. It is 4" long and ${BARREL_OD}" across. A 1" clamp will not close on it, so each half needs a 1" to 3/4" shim.`
+      : pipe === "half"
+        ? `Barrel hinge, ${money(BARREL_PRICE)}. Clamp a 3/4" connector on each half. The 1/2" pipe in that connector needs a shim. The barrel itself is too big to shim down to 1/2".`
+        : `Barrel hinge, ${money(BARREL_PRICE)}. It is 4" long and ${BARREL_OD}" across — 0.018" over 3/4" EMT. The 3/4" clamp still closes on it, so this size does not take a shim.`;
+  }
+  return `Adjustable angle hinge, ${money(ANGLE_HINGE_PRICE[pipe])} complete. Leave the top bolt loose and the pipe folds up to 90° either way.${pipe === "half" ? " The 1/2\" price includes the shims." : ""}`;
+}
+
+function uprightPost(member: Member): boolean {
+  if (member.kind !== "post") return false;
+  const dy = member.b[1] - member.a[1];
+  const span = Math.hypot(member.b[0] - member.a[0], dy, member.b[2] - member.a[2]) || 1;
+  return dy / span > 0.92;
+}
+
+function doorOf(project: FullProject, member: Member | null): Door | null {
+  if (!member) return null;
+  const direct = project.doors.find((door) => door.memberId === member.id);
+  if (direct) return direct;
+  const cut = member.id.indexOf(":");
+  const sketchId = cut < 0 ? "" : member.id.slice(cut + 1).replace(/:hi$/, "").replace(/:stub[AB]$/, "");
+  const byNode = project.doors.find((door) => door.hingeNode === sketchId || door.latchNode === sketchId);
+  if (byNode) return byNode;
+  const link = project.links.find((item) => item.id === sketchId);
+  if (!link) return null;
+  const node = project.nodes.find((item) => (item.id === link.a || item.id === link.b) && item.door);
+  if (!node?.door) return null;
+  return project.doors.find((door) => door.id === node.door) ?? null;
+}
+
+function DoorTune({ door, unit }: { door: Door; unit: "in" | "ft" }) {
+  const projects = useShop((s) => s.projects);
+  const activeId = useShop((s) => s.activeId);
+  const setDoorWidth = useShop((s) => s.setDoorWidth);
+  const setHingeSwing = useShop((s) => s.setHingeSwing);
+  const removeDoor = useShop((s) => s.removeDoor);
+  const doorNote = useShop((s) => s.doorNote);
+  const project = normalizeProject(projects.find((item) => item.id === activeId) ?? projects[0]);
+  const kind = project.hinges.find((hinge) => hinge.memberId === door.memberId)?.kind ?? "leaf";
+  const max = hingeOpenMax(kind === "angle" ? "leaf" : kind);
+  const swing = project.hingeSwing.find((item) => item.memberId === door.memberId)?.deg ?? 0;
+  return (
+    <div className="swing" data-testid="door-tune">
+      <LenField
+        label="Door width"
+        testId="door-width"
+        inches={door.width}
+        unit={unit}
+        min={8}
+        max={96}
+        onCommit={(width) => setDoorWidth(door.id, width)}
+      />
+      <p className="fine">{swing < 1 ? "Shut." : `Open ${Math.round(swing)}°.`}</p>
+      <input
+        data-testid="door-swing"
+        type="range"
+        min={0}
+        max={max}
+        step={1}
+        value={Math.min(max, swing)}
+        aria-label="How far the door is open"
+        onChange={(event) => setHingeSwing(door.memberId, Number(event.target.value))}
+      />
+      <div className="lean-end" role="group" aria-label="Swing the door">
+        <button type="button" className="btn" onClick={() => setHingeSwing(door.memberId, 0)}>
+          Shut
+        </button>
+        <button type="button" className="btn" onClick={() => setHingeSwing(door.memberId, swing - 15)}>
+          Close
+        </button>
+        <button type="button" className="btn" onClick={() => setHingeSwing(door.memberId, swing + 15)}>
+          Open
+        </button>
+        <button type="button" className="btn" onClick={() => setHingeSwing(door.memberId, max)}>
+          Wide
+        </button>
+      </div>
+      {doorNote ? <p className="fine">{doorNote}</p> : null}
+      <p className="fine">This frame is real pipe on the cut list. It is not clamped to the post. Straps on it take lumber, and this swing takes that lumber with the door.</p>
+      <DeleteButton name="door" onDelete={() => removeDoor(door.id)} />
+    </div>
+  );
+}
+
+function DoorCard({ unit, member }: { unit: "in" | "ft"; member: Member | null }) {
+  const projects = useShop((s) => s.projects);
+  const activeId = useShop((s) => s.activeId);
+  const placeDoor = useShop((s) => s.placeDoor);
+  const select = useShop((s) => s.select);
+  const doorNote = useShop((s) => s.doorNote);
+  const project = normalizeProject(projects.find((item) => item.id === activeId) ?? projects[0]);
+  const door = doorOf(project, member);
+  const [width, setWidth] = useState(32);
+  const mine = member ? project.hinges.filter((hinge) => hinge.memberId === member.id) : [];
+  const angled = mine.length > 0 && mine.every((hinge) => hinge.kind === "angle");
+  const usable = member != null && uprightPost(member) && mine.some((hinge) => hinge.kind !== "angle");
+  return (
+    <div className="float-card" data-testid="door-card">
+      <div className="card-head">
+        <h2>Door</h2>
+        <Confirm onConfirm={() => select(null)} />
+      </div>
+      {project.mode !== "sketch" ? (
+        <p className="fine">Choose Edit these posts freely before hanging a door. A rectangle shares every post.</p>
+      ) : door ? (
+        <DoorTune door={door} unit={unit} />
+      ) : !member ? (
+        <p className="fine">Click a glowing hinge. Those are the only places a door can hang. Then set the width and place it.</p>
+      ) : angled ? (
+        <p className="fine">An angle hinge folds a pipe. A door needs offset or barrel hinges on an upright post.</p>
+      ) : !usable ? (
+        <p className="fine">A door hangs on offset or barrel hinges on an upright post. A rail can take a hinge, but not a door.</p>
+      ) : (
+        <>
+          <LenField label="Door width" testId="door-width" inches={width} unit={unit} min={8} max={96} onCommit={setWidth} />
+          <p className="fine">Width is the closed opening, from the hinge stile to the latch stile. 32 inches is a common gate.</p>
+          <button type="button" className="btn" data-testid="door-place" onClick={() => placeDoor(member.id, width)}>
+            Place door
+          </button>
+          {doorNote ? <p className="fine">{doorNote}</p> : null}
+          <p className="fine">Once it is placed, the stiles and rails are ordinary pipe. Add straps, then lumber, and the door swings with that wood.</p>
+        </>
+      )}
+    </div>
+  );
+}
+
 function SelectionCard({
   unit,
   member,
@@ -1079,7 +1884,6 @@ function SelectionCard({
   const patchNode = useShop((s) => s.patchNode);
   const setMemberTrade = useShop((s) => s.setMemberTrade);
   const setClampHeight = useShop((s) => s.setClampHeight);
-  const patchLink = useShop((s) => s.patchLink);
   const removeNode = useShop((s) => s.removeNode);
   const removeLink = useShop((s) => s.removeLink);
   const resizeBar = useShop((s) => s.resizeBar);
@@ -1141,13 +1945,29 @@ function SelectionCard({
   }
   if (!member || (member.kind !== "post" && member.kind !== "rail" && member.kind !== "brace")) return null;
   const notes = alignmentNotes(buildMembers, member.id);
-  const sketchId = member.id.includes(":") ? member.id.slice(member.id.indexOf(":") + 1) : null;
+  const raw = member.id.includes(":") ? member.id.slice(member.id.indexOf(":") + 1) : null;
+  const sketchId = raw ? raw.replace(/:hi$/, "").replace(/:stub[AB]$/, "") : null;
   const node = sketchId ? project.nodes.find((n) => n.id === sketchId) : null;
   const link = sketchId ? project.links.find((l) => l.id === sketchId) : null;
+  const hung = doorOf(project, member);
+  const doorRail =
+    link != null &&
+    project.nodes.some((item) => item.id === link.a && item.door) &&
+    project.nodes.find((item) => item.id === link.a)?.door === project.nodes.find((item) => item.id === link.b)?.door;
   return (
     <div className="float-card">
       <div className="card-head">
-        <h2>{member.kind === "post" ? `Post ${node ? names.get(node.id) : ""}` : member.kind === "rail" ? "Rail" : "Brace"}</h2>
+        <h2>
+          {member.kind === "post"
+            ? node?.door
+              ? `Door stile ${names.get(node.id) ?? ""}`
+              : `Post ${node ? names.get(node.id) : ""}`
+            : member.kind === "rail"
+              ? doorRail
+                ? "Door rail"
+                : "Rail"
+              : "Brace"}
+        </h2>
         <Confirm onConfirm={onDone} />
       </div>
       {project.mode === "sketch" && member.kind === "post" && node ? (
@@ -1155,14 +1975,31 @@ function SelectionCard({
           <BarModes mode={barEdit} onChange={setBarEdit} />
           {barEdit === "resize" ? (
             <>
-              <LenField label="Height" inches={node.height} unit={unit} min={12} max={240} onCommit={(height) => patchNode(node.id, { height })} />
-              <LenField label="Underground" inches={node.bury ?? 0} unit={unit} min={0} max={96} testId="bury" onCommit={(bury) => patchNode(node.id, { bury })} />
-              <p className="fine">Height is what you see above the floor. Underground is added to this post’s cut only.</p>
+              <LenField
+                label={node.door ? "Top" : "Height"}
+                inches={node.height}
+                unit={unit}
+                min={node.door ? 8 : 12}
+                max={240}
+                onCommit={(height) => {
+                  const split = postSplit(node);
+                  patchNode(node.id, { height: Math.min(240, split != null ? Math.max(height, split + 2) : height) });
+                }}
+              />
+              {node.door ? (
+                <p className="fine">Top is how high this stile reaches. It starts above the floor, on the hinges.</p>
+              ) : (
+                <>
+                  <LenField label="Underground" inches={node.bury ?? 0} unit={unit} min={0} max={96} testId="bury" onCommit={(bury) => patchNode(node.id, { bury })} />
+                  <p className="fine">Height is what you see above the floor. Underground is added to this post’s cut only.</p>
+                </>
+              )}
               <PieceSize
                 value={node.trade ?? project.trade}
                 overridden={node.trade != null}
                 onPick={(trade) => setMemberTrade("node", node.id, trade)}
               />
+              <PostExtras node={node} unit={unit} />
             </>
           ) : (
             <MoveControl target={{ kind: "post", id: node.id }} unit={unit} />
@@ -1182,6 +2019,7 @@ function SelectionCard({
       {project.mode !== "sketch" && member.kind === "post" ? (
         <p className="fine">Rectangle posts share a height. Start over to set each one.</p>
       ) : null}
+      {project.mode !== "sketch" && member.kind === "post" ? <GridCaps memberId={member.id} /> : null}
       {project.mode === "sketch" && link && (member.kind === "rail" || member.kind === "brace") ? (
         <>
         <BarEditor
@@ -1194,13 +2032,19 @@ function SelectionCard({
           nodes={project.nodes}
           onResize={(length) => resizeBar(link.id, length)}
           onMove={(x, z, y) => repositionBar(link.id, x, z, y, false)}
-          onEnds={(y, yB) => patchLink(link.id, { y, yB })}
+          onEnds={(y, yB) =>
+            update({
+              nodes: slideSplits(project, link, y, yB),
+              links: project.links.map((item) => (item.id === link.id ? { ...item, y, yB } : item)),
+            })
+          }
         />
         <PieceSize
           value={link.trade ?? project.trade}
           overridden={link.trade != null}
           onPick={(trade) => setMemberTrade("link", link.id, trade)}
         />
+        {member.kind === "rail" ? <RailEnds link={link} unit={unit} /> : null}
         </>
       ) : null}
       {project.mode !== "sketch" && member.kind === "rail" ? (
@@ -1215,7 +2059,8 @@ function SelectionCard({
         </p>
       ))}
       {member.kind === "post" || member.kind === "rail" ? <WoodStraps member={member} straps={straps} unit={unit} /> : null}
-      {project.mode === "sketch" && node ? <DeleteButton name="post" onDelete={() => { removeNode(node.id); onDone(); }} /> : null}
+      {hung ? <DoorTune door={hung} unit={unit} /> : null}
+      {project.mode === "sketch" && node && !node.door ? <DeleteButton name="post" onDelete={() => { removeNode(node.id); onDone(); }} /> : null}
       {project.mode === "sketch" && link ? (
         <DeleteButton name={member.kind === "brace" ? "brace" : "rail"} onDelete={() => { removeLink(link.id); onDone(); }} />
       ) : null}
@@ -1774,6 +2619,7 @@ export function AppShell() {
   const startSketch = useShop((s) => s.startSketch);
   const unlockFrame = useShop((s) => s.unlockFrame);
   const placePost = useShop((s) => s.placePost);
+  const placeTip = useShop((s) => s.placeTip);
   const movePost = useShop((s) => s.movePost);
   const movePostHeight = useShop((s) => s.movePostHeight);
   const moveLink = useShop((s) => s.moveLink);
@@ -1783,6 +2629,8 @@ export function AppShell() {
   const setShowLabels = useShop((s) => s.setShowLabels);
   const showLumber = useShop((s) => s.showLumber);
   const setShowLumber = useShop((s) => s.setShowLumber);
+  const showHingePreview = useShop((s) => s.showHingePreview);
+  const setShowHingePreview = useShop((s) => s.setShowHingePreview);
   const loadMode = useShop((s) => s.loadMode);
   const loadTool = useShop((s) => s.loadTool);
   const shopLoads = useShop((s) => s.shopLoads);
@@ -1812,6 +2660,7 @@ export function AppShell() {
     setBarEdit("resize");
   }, [selectedId]);
   const [refsOpen, setRefsOpen] = useState(false);
+  const [viewOpen, setViewOpen] = useState(false);
   const [startReady, setStartReady] = useState(false);
   const [packetOn, setPacketOn] = useState(false);
   const [packetImage, setPacketImage] = useState<string | null>(null);
@@ -2051,22 +2900,6 @@ export function AppShell() {
           value={project.name}
           onChange={(e) => update({ name: e.target.value.slice(0, 48) })}
         />
-        <select
-          className="project-select"
-          aria-label="Drawings on this device"
-          title="Drawings kept on this device"
-          value={project.id}
-          onChange={(e) => {
-            open(e.target.value);
-            setLoadFocus(null);
-          }}
-        >
-          {projects.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.name}
-            </option>
-          ))}
-        </select>
         <div className="top-actions">
           <button type="button" className="icon-btn" aria-label="Undo" title="Undo" disabled={!canUndo} onClick={undo}>
             <Undo2 size={16} />
@@ -2092,6 +2925,9 @@ export function AppShell() {
               void openDrawing(file);
             }}
           />
+          <button type="button" className="btn" data-testid="save-packet" onClick={savePacket}>
+            PDF
+          </button>
           {loadMode ? (
             <button type="button" className="btn primary" data-testid="load-test" onClick={() => setLoadMode(false)}>
               Back to build
@@ -2237,6 +3073,26 @@ export function AppShell() {
               <Trash2 size={16} /> Delete
             </button>
           </div>
+          {projects.length > 1 ? (
+            <div className="tool-row">
+              <p className="fine">Also on this device</p>
+              {projects
+                .filter((item) => item.id !== project.id)
+                .map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className="btn"
+                    onClick={() => {
+                      open(item.id);
+                      setLoadFocus(null);
+                    }}
+                  >
+                    {item.name}
+                  </button>
+                ))}
+            </div>
+          ) : null}
           {project.mode === "sketch" ? (
             <FreeBuild unit={unit} />
           ) : (
@@ -2426,12 +3282,12 @@ export function AppShell() {
           </section>
         </aside>
 
-        <div className={`view no-print${loadMode ? " tool-load" : project.mode === "sketch" || tool === "measure" || tool === "lumber" ? ` tool-${tool}` : ""}`}>
+        <div className={`view no-print${loadMode ? " tool-load" : project.mode === "sketch" || tool === "measure" || tool === "lumber" || tool === "hinge" || tool === "door" ? ` tool-${tool}` : ""}`}>
           <Viewport
             project={project}
             build={build}
             selected={selectedId}
-            tool={loadMode ? "select" : project.mode === "sketch" || tool === "measure" || tool === "lumber" ? tool : "select"}
+            tool={loadMode ? "select" : project.mode === "sketch" || tool === "measure" || tool === "lumber" || tool === "hinge" || tool === "door" ? tool : "select"}
             anchor={anchor}
             unit={unit}
             showMeasures={showMeasures}
@@ -2450,6 +3306,10 @@ export function AppShell() {
               const empty = project.nodes.length === 0;
               placePost(x, z);
               if (empty) setNonce((n) => n + 1);
+            }}
+            onTip={(x, z) => {
+              if (loadMode || tool !== "rail" || !draft) return;
+              placeTip(x, z);
             }}
             onClear={() => {
               if (loadMode) {
@@ -2501,6 +3361,12 @@ export function AppShell() {
                   <button type="button" className={tool === "lumber" ? "btn on" : "btn"} onClick={() => setTool(tool === "lumber" ? "select" : "lumber")}>
                     Lumber
                   </button>
+                  <button type="button" className={tool === "hinge" ? "btn on" : "btn"} onClick={() => setTool(tool === "hinge" ? "select" : "hinge")}>
+                    Hinge
+                  </button>
+                  <button type="button" className={tool === "door" ? "btn on" : "btn"} onClick={() => setTool(tool === "door" ? "select" : "door")}>
+                    Door
+                  </button>
                   <button type="button" className={tool === "measure" ? "btn on" : "btn"} onClick={() => setTool(tool === "measure" ? "select" : "measure")}>
                     Measure
                   </button>
@@ -2513,30 +3379,6 @@ export function AppShell() {
               onClick={() => setRefsOpen((open) => !open)}
             >
               Refs
-            </button>
-            <button
-              type="button"
-              className={showLabels ? "btn on" : "btn"}
-              aria-pressed={showLabels}
-              onClick={() => setShowLabels(!showLabels)}
-            >
-              Labels
-            </button>
-            <button
-              type="button"
-              className={showMeasures ? "btn on" : "btn"}
-              aria-pressed={showMeasures}
-              onClick={() => setShowMeasures(!showMeasures)}
-            >
-              Sizes
-            </button>
-            <button
-              type="button"
-              className={showLumber ? "btn on" : "btn"}
-              aria-pressed={showLumber}
-              onClick={() => setShowLumber(!showLumber)}
-            >
-              Wood
             </button>
             <div className="seg" role="group" aria-label="EMT size for the whole drawing" title="Changes every pipe, and clears per-piece sizes">
               {TRADES.map((t) => (
@@ -2552,17 +3394,44 @@ export function AppShell() {
                 </button>
               ))}
             </div>
+          </div>
+          <div className="view-dock no-print">
             <button
               type="button"
-              className="btn"
-              data-testid="save-packet"
-              onClick={savePacket}
+              className={viewOpen ? "view-tab on" : "view-tab"}
+              aria-expanded={viewOpen}
+              aria-controls="view-layers"
+              aria-label="View layers"
+              onClick={() => setViewOpen((open) => !open)}
             >
-              PDF
+              <Layers size={20} />
+              <span>View</span>
+              <ChevronRight size={14} className="view-chevron" />
             </button>
+            {viewOpen ? (
+              <div id="view-layers" className="view-menu" role="group" aria-label="Show or hide">
+                <p className="view-kicker">Layers</p>
+                <button type="button" className={showLabels ? "layer-row on" : "layer-row"} aria-pressed={showLabels} onClick={() => setShowLabels(!showLabels)}>
+                  <span className="layer-mark" aria-hidden />
+                  Labels
+                </button>
+                <button type="button" className={showMeasures ? "layer-row on" : "layer-row"} aria-pressed={showMeasures} onClick={() => setShowMeasures(!showMeasures)}>
+                  <span className="layer-mark" aria-hidden />
+                  Measurements
+                </button>
+                <button type="button" className={showLumber ? "layer-row on" : "layer-row"} aria-pressed={showLumber} onClick={() => setShowLumber(!showLumber)}>
+                  <span className="layer-mark" aria-hidden />
+                  Wood
+                </button>
+                <button type="button" className={showHingePreview ? "layer-row on" : "layer-row"} aria-pressed={showHingePreview} data-testid="hinge-ghosts" onClick={() => setShowHingePreview(!showHingePreview)}>
+                  <span className="layer-mark" aria-hidden />
+                  Hinge ghosts
+                </button>
+              </div>
+            ) : null}
           </div>
           <div className="canvas-side no-print">
-            {project.mode === "sketch" && !draft && !refsOpen && tool !== "lumber" ? <ShapeCard unit={unit} onPlaced={() => setNonce((n) => n + 1)} /> : null}
+            {project.mode === "sketch" && !draft && !refsOpen && tool !== "lumber" && tool !== "hinge" && tool !== "door" ? <ShapeCard unit={unit} onPlaced={() => setNonce((n) => n + 1)} /> : null}
             {refsOpen ? (
               <div className="float-card">
                 <div className="card-head">
@@ -2588,6 +3457,10 @@ export function AppShell() {
             ) : null}
             {draft ? <DraftCard unit={unit} names={postNames(project.nodes, project.links)} /> : null}
             {tool === "lumber" && !refsOpen ? <LumberCard unit={unit} project={project} build={build} /> : null}
+            {tool === "hinge" && !draft && !refsOpen && selectedMember && (selectedMember.kind === "post" || selectedMember.kind === "rail") ? (
+              <HingeCard unit={unit} member={selectedMember} />
+            ) : null}
+            {tool === "door" && !draft && !refsOpen ? <DoorCard unit={unit} member={selectedMember} /> : null}
             {tool !== "lumber" && project.boards.find((item) => selectedId === `board:${item.id}`) ? (
               <BoardCard
                 board={project.boards.find((item) => selectedId === `board:${item.id}`)!}
@@ -2602,7 +3475,7 @@ export function AppShell() {
             {!draft && !refsOpen && project.references.find((item) => selectedId === `ref:${item.id}`) ? (
               <RefCard unit={unit} item={project.references.find((item) => selectedId === `ref:${item.id}`)!} onDone={() => select(null)} />
             ) : null}
-            {!draft && !refsOpen && tool !== "lumber" && !selectedId?.startsWith("board:") && !selectedId?.startsWith("ref:") && !(anchor && (tool === "rail") && !startReady) ? (
+            {!draft && !refsOpen && tool !== "lumber" && tool !== "hinge" && tool !== "door" && !selectedId?.startsWith("board:") && !selectedId?.startsWith("ref:") && !(anchor && (tool === "rail") && !startReady) ? (
               <SelectionCard
                 unit={unit}
                 member={selectedMember}
@@ -2622,10 +3495,13 @@ export function AppShell() {
             <p className="pick-hint">
               {draft
                 ? draft.stops.length < 2
-                  ? "Now the next post, or the middle of a rail. Add as many as you need."
-                  : "Set the height, or turn a pipe to 45° and use the arrows."
+                  ? "Click the next post, the middle of a rail, or the floor to leave this end open."
+                  : "Set the height, or turn a pipe to 45° and use the arrows. Click the floor to leave the last end open."
                 : "Click a glowing post or the middle of a rail. A run can visit as many posts as you need."}
             </p>
+          ) : null}
+          {tool === "hinge" && !(selectedMember && (selectedMember.kind === "post" || selectedMember.kind === "rail")) ? (
+            <p className="pick-hint">Click a post or a rail. Place sets the count and the height. Swing previews the motion. Use Door to hang a real frame.</p>
           ) : null}
           {tool === "lumber" ? <p className="pick-hint">Shingles and metal roof: click the OSB. Other lumber: click two clamps or boards. A sheet follows that slope unless something higher holds it up.</p> : null}
           <div className="hud">
@@ -2719,7 +3595,7 @@ export function AppShell() {
                 {build.conduitCost > 0
                   ? `Conduit about ${money(build.conduitCost)} at your price. `
                   : "Enter what the yard charges and the stick cost shows up here. "}
-                Packing allows 1/8" kerf between pieces from the same stick. Posts run continuous through the clamps. Underground length is in the cut, not in the size on screen.
+                Packing allows 1/8" kerf between pieces from the same stick. A post runs through its clamps unless you split it, and then the rail is the through pipe. Underground length is in the cut, not in the size on screen.
               </p>
             </div>
           ) : null}
@@ -2736,27 +3612,92 @@ export function AppShell() {
                     <span className="qty">{line.qty}×</span>
                     <span>
                       <strong>{line.name}</strong>
-                      <em>
-                        {line.purchasable ? `${money(line.unitPrice)} from` : "Not sold for this size"}
-                        {line.shimsEach ? ` · ${line.shimsEach} shim${line.shimsEach === 1 ? "" : "s"} each` : ""}
-                      </em>
+                      <em>{line.purchasable ? `${money(line.unitPrice)} from` : "Not sold for this size"}</em>
                     </span>
                     <b>{line.purchasable ? money(line.qty * line.unitPrice) : "—"}</b>
                   </li>
                 ))}
+                {build.oneShimCount > 0 ? (
+                  <li>
+                    <span className="qty">{build.oneShimCount}×</span>
+                    <span>
+                      <strong>1" to 3/4" adapter shim</strong>
+                      <em>{money(ONE_SHIM_PRICE)} each · one for every 3/4" pipe a 1" clamp grabs</em>
+                    </span>
+                    <b>{money(build.oneShimCount * ONE_SHIM_PRICE)}</b>
+                  </li>
+                ) : null}
+                {build.shimCount > 0 ? (
+                  <li>
+                    <span className="qty">{build.shimCount}×</span>
+                    <span>
+                      <strong>3/4" to 1/2" adapter shim</strong>
+                      <em>{money(SHIM_PRICE)} each · one for every 1/2" pipe in a 3/4" clamp</em>
+                    </span>
+                    <b>{money(build.shimCount * SHIM_PRICE)}</b>
+                  </li>
+                ) : null}
+                {build.straps.length > 0 ? (
+                  <li>
+                    <span className="qty">{build.straps.length}×</span>
+                    <span>
+                      <strong>One-hole strap</strong>
+                      <em>{money(STRAP_PRICE)} each · a pack of 4 is {money(STRAP_PACK_PRICE)}. Screws to wood. Does not change the cut.</em>
+                    </span>
+                    <b>{money(build.strapCost)}</b>
+                  </li>
+                ) : null}
+                {build.hardware.map((line) => (
+                  <li key={line.id}>
+                    <span className="qty">{line.qty}×</span>
+                    <span>
+                      <strong>{line.name}</strong>
+                      <em>{line.purchasable ? `${money(line.unitPrice)} · ${line.detail}` : line.detail}</em>
+                    </span>
+                    <b>{line.purchasable ? money(line.qty * line.unitPrice) : "—"}</b>
+                  </li>
+                ))}
+                {build.caps.map((line) => (
+                  <li key={`cap-${line.trade}`}>
+                    <span className="qty">{line.qty}×</span>
+                    <span>
+                      <strong>{line.label} end cap</strong>
+                      <em>{money(line.unitPrice)} each · packs of 10 are {money(line.packPrice)}. Taps into an open end.</em>
+                    </span>
+                    <b>{money((line.qty * line.packPrice) / 10)}</b>
+                  </li>
+                ))}
               </ul>
-              {build.oneShimCount > 0 ? (
-                <p className="fine">Plus {build.oneShimCount} of the 1" to 3/4" shims so a 1" clamp can grab smaller tube.</p>
-              ) : null}
-              {build.shimCount > 0 ? (
-                <p className="fine">
-                  Plus {build.shimCount} adapter shims ({money(build.shimCount * 0.1)}). A 1/2" pipe in a 3/4" clamp needs one. The 1" shim is listed separately.
-                </p>
-              ) : null}
-              {build.straps.length > 0 ? (
-                <p className="fine">
-                  {build.straps.length} one-hole strap{build.straps.length === 1 ? "" : "s"} ({money(build.strapCost)}). They snap on and screw to wood. A pack of 4 is {money(STRAP_PACK_PRICE)}. They do not change the cut.
-                </p>
+              {project.boards.length > 0 ? (
+                <>
+                  <h3>Lumber and panels</h3>
+                  <ul className="part-rows">
+                    {project.boards.map((board) => {
+                      const laid = layoutBoard(board, {
+                        fittings: build.fittings.map((item) => ({ id: item.id, sku: item.sku, position: item.position })),
+                        members: build.members.map((item) => ({ id: item.id, a: item.a, b: item.b })),
+                        boards: project.boards,
+                        straps: strapPoints(build.straps, build.members),
+                        pipeRadius: trade.od / 2,
+                      });
+                      const wide = board.kind === "osb" || board.kind === "plastic" || board.kind === "shingle" || board.kind === "metal";
+                      const size = wide
+                        ? `${Math.round(board.sheetWidth)}" × ${laid && !laid.error ? L(laid.length) : "check the clamps"}`
+                        : laid && !laid.error
+                          ? L(laid.length)
+                          : "won’t fit, check the clamps";
+                      return (
+                        <li key={board.id}>
+                          <span className="qty">1×</span>
+                          <span>
+                            <strong>{boardTitle(board)}</strong>
+                            <em>{size} · from the yard</em>
+                          </span>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </>
               ) : null}
               <p className="fine">
                 Prices are MakerPipe’s published starting prices, hardware included, and they move. This is a planning aid, not a cart and not affiliated with MakerPipe.

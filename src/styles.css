@@ -142,6 +142,10 @@
   right: 0.5rem;
 }
 
+.workspace:has(.drawer.right.open) .canvas-side {
+  display: none;
+}
+
 .drawer:not(.open) {
   display: none;
 }
@@ -306,6 +310,39 @@ h3 {
   display: flex;
   align-items: flex-end;
   gap: 0.4rem;
+}
+
+.nudge {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.3rem;
+}
+
+.nudge .field {
+  flex: 1;
+}
+
+.nudge .btn {
+  min-width: 2.5rem;
+  padding-inline: 0.35rem;
+  margin-bottom: 0.35rem;
+}
+
+.joint {
+  margin-top: 0.15rem;
+  padding-top: 0.35rem;
+  border-top: 1px solid var(--color-line);
+}
+
+.seg.joint-pick {
+  display: flex;
+  width: 100%;
+  margin: 0.15rem 0 0.25rem;
+}
+
+.seg.joint-pick button {
+  flex: 1;
+  padding-inline: 0.4rem;
 }
 
 .btn,
@@ -579,11 +616,122 @@ h3 {
   font-size: 0.78rem;
 }
 
+.view-dock {
+  position: absolute;
+  z-index: 6;
+  left: 0.55rem;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  pointer-events: none;
+}
+
+.workspace:has(.drawer.left.open) .view-dock {
+  left: calc(min(22rem, calc(100% - 1rem)) + 0.7rem);
+}
+
+.view-tab {
+  pointer-events: auto;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.15rem;
+  width: 3.6rem;
+  padding: 0.55rem 0.3rem 0.4rem;
+  border-radius: 0.75rem;
+  border: 1px solid var(--color-line);
+  background: color-mix(in srgb, var(--color-bg) 94%, transparent);
+  color: var(--color-fg);
+  font: inherit;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  box-shadow:
+    5px 5px 0 color-mix(in srgb, var(--color-surface-2) 92%, #000),
+    10px 10px 0 color-mix(in srgb, var(--color-line) 85%, #000);
+}
+
+.view-tab.on {
+  background: var(--color-accent);
+  color: var(--color-accent-ink);
+  border-color: var(--color-accent);
+}
+
+.view-chevron {
+  margin-top: 0.05rem;
+}
+
+.view-menu {
+  pointer-events: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  min-width: 11.5rem;
+  margin-top: 0.35rem;
+  margin-left: 0.35rem;
+  padding: 0.45rem;
+  border-radius: 0.75rem;
+  border: 1px solid var(--color-line);
+  background: color-mix(in srgb, var(--color-bg) 96%, transparent);
+  box-shadow: 8px 10px 0 color-mix(in srgb, var(--color-line) 70%, transparent);
+}
+
+.view-kicker {
+  margin: 0 0.25rem 0.05rem;
+  color: var(--color-muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.layer-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 38px;
+  padding: 0.2rem 0.6rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--color-line);
+  background: var(--color-surface-2);
+  color: var(--color-fg);
+  font: inherit;
+  font-size: 0.88rem;
+  text-align: left;
+}
+
+.layer-row.on {
+  background: var(--color-accent);
+  color: var(--color-accent-ink);
+  border-color: var(--color-accent);
+}
+
+.layer-mark {
+  width: 0.72rem;
+  height: 0.72rem;
+  border-radius: 0.16rem;
+  border: 1.5px solid currentColor;
+  box-shadow: 3px 3px 0 currentColor;
+  opacity: 0.45;
+}
+
+.layer-row.on .layer-mark {
+  opacity: 1;
+}
+
 .tool-row {
   display: flex;
   flex-wrap: wrap;
   gap: 0.35rem;
   margin: 0.45rem 0 0.2rem;
+}
+
+.tool-row .fine {
+  flex: 1 1 100%;
 }
 
 .tool-row button {
@@ -597,11 +745,32 @@ h3 {
 
 .view.tool-post .scene,
 .view.tool-rail .scene,
+.view.tool-hinge .scene,
+.view.tool-door .scene,
 .view.tool-lumber .scene,
 .view.tool-brace .scene,
 .view.tool-erase .scene,
 .view.tool-measure .scene {
   cursor: crosshair;
+}
+
+.hinge-kind {
+  width: 100%;
+  margin: 0.2rem 0 0.45rem;
+}
+
+.hinge-kind button {
+  flex: 1;
+}
+
+.hinge-seat {
+  margin-top: 0.35rem;
+}
+
+.swing input[type="range"] {
+  width: 100%;
+  margin: 0.35rem 0 0.55rem;
+  accent-color: var(--color-accent);
 }
 
 .canvas-side {
@@ -667,6 +836,10 @@ h3 {
   max-width: min(36rem, calc(100% - 1.5rem));
 }
 
+.view:has([data-testid="hinge-card"]) > .pick-hint {
+  display: none;
+}
+
 .dim-tag.on {
   box-shadow: 0 0 0 2px #141614, 0 0 0 4px #f4e7c3;
 }
@@ -677,6 +850,7 @@ h3 {
 
 .workspace.load-mode .drawer,
 .workspace.load-mode .toolbelt,
+.workspace.load-mode .view-dock,
 .workspace.load-mode .canvas-side,
 .workspace.load-mode .pick-hint {
   display: none;
@@ -1365,6 +1539,10 @@ a {
     bottom: 0.35rem;
     width: auto;
     max-height: 42vh;
+  }
+
+  .workspace:has(.drawer.left.open) .view-dock {
+    left: 0.55rem;
   }
 
   .workspace:has(.drawer.open) .hud,

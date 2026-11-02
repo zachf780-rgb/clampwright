@@ -1010,5 +1010,7 @@ function fake(id: string, kind: Member["kind"], a: V3, b: V3, label: string): Me
     setbackB: 0,
     seatA: "",
     seatB: "",
+    caps: 0,
+    capAt: [],
   };
 }

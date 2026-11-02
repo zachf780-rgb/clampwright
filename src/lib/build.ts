@@ -5,6 +5,14 @@ import {
   SHIM_PRICE,
   ONE_SHIM_PRICE,
   STRAP_PRICE,
+  ANGLE_HINGE_PRICE,
+  BARREL_LENGTH,
+  BARREL_PRICE,
+  LEAF_SET_COUNT,
+  LEAF_SET_PRICE,
+  CAP_PACK,
+  capEach,
+  capPackPrice,
   connectorPrice,
   skuShort,
   type FamilySpec,
@@ -23,6 +31,13 @@ export type Vec3 = [number, number, number];
 export type Dir = "+x" | "-x" | "+z" | "-z";
 
 export type FloorKind = "grass" | "dirt" | "concrete" | "wood";
+
+/** End cap on a rectangle post. Free-build caps are stored on the post itself. */
+export type Plug = {
+  id: string;
+  top?: boolean;
+  foot?: boolean;
+};
 
 export type Project = {
   id: string;
@@ -55,6 +70,14 @@ export type Project = {
   loads?: ShopLoad[];
   /** Ground in the finished view. Editing still uses the grid. */
   floor?: FloorKind;
+  /** End caps on rectangle posts, keyed by member id. Free-build caps live on the post. */
+  plugs?: Plug[];
+  /** Door hardware on a post or a rail. The pale gate is only a preview. */
+  hinges?: Hinge[];
+  /** How far each hinged pipe is swung open, in degrees. Closed is omitted. */
+  hingeSwing?: HingeSwing[];
+  /** A real door frame hung on one pipe's hinges. The pipes are ordinary posts and rails. */
+  doors?: Door[];
 };
 
 export type SketchNode = {
@@ -71,6 +94,18 @@ export type SketchNode = {
   host?: string;
   /** Fraction along the host rail, so the joint stays put when an end moves. */
   hostT?: number;
+  /** Plug the open top of this post. */
+  cap?: boolean;
+  /** Plug the foot. Counted only when the post is not buried and has no flange. */
+  capFoot?: boolean;
+  /** Height above the floor where this post is two pieces. A rail at that height is the through pipe. */
+  split?: number;
+  /** Free end of a rail. Not a post, and not a clamp. */
+  tip?: boolean;
+  /** Where a post starts, if it does not sit on the floor. Used by door stiles. */
+  base?: number;
+  /** Set when this post is one stile of a door. */
+  door?: string;
 };
 
 export type SketchLink = {
@@ -84,6 +119,18 @@ export type SketchLink = {
   kind: "rail" | "brace";
   /** Overrides the frame's EMT size for this rail. */
   trade?: TradeId;
+  /** Inches the pipe continues past the post at A. On a split post this lengthens the through rail. On a cut rail it is a separate stub. */
+  pastA?: number;
+  /** Inches the pipe continues past the post at B. */
+  pastB?: number;
+  /** Plug the open tip at A. A free end, the stick-out past a split post, or the stub of a cut rail. */
+  capA?: boolean;
+  /** Plug the open tip at B. */
+  capB?: boolean;
+  /** Which pipe is cut where this rail meets post A. `vertical` cuts the post. `horizontal` cuts this rail. */
+  cutA?: "vertical" | "horizontal";
+  /** Which pipe is cut where this rail meets post B. */
+  cutB?: "vertical" | "horizontal";
 };
 
 export type MeasureRef = {
@@ -103,6 +150,49 @@ export type Strap = {
   at: number;
 };
 
+/** MakerPipe hinge that can actually swing. `leaf` is the offset EMT set, `barrel` is inline, `angle` folds to 90°. */
+export type HingeKind = "leaf" | "barrel" | "angle";
+
+export type Hinge = {
+  id: string;
+  memberId: string;
+  kind: HingeKind;
+  /** Inches from the start of the pipe. A post starts at the floor. */
+  at: number;
+  /** Which face of the bar the knuckle sits on. The other face swings the other way. */
+  side: 1 | -1;
+};
+
+export type HingeSwing = {
+  memberId: string;
+  deg: number;
+};
+
+/** A rectangular pipe door. The hinge stile is `hingeNode`, the latch stile is `latchNode`. */
+export type Door = {
+  id: string;
+  /** Post the hinges are on. The door is not clamped to it. */
+  memberId: string;
+  /** Inches from the hinge stile to the latch stile, closed. */
+  width: number;
+  hingeNode: string;
+  latchNode: string;
+  bottomRail: string;
+  topRail: string;
+  /** Plan direction from the hinge stile to the latch stile. One axis is 1 or -1, the other is 0. */
+  dirX: number;
+  dirZ: number;
+};
+
+export type HardwareLine = {
+  id: string;
+  name: string;
+  qty: number;
+  unitPrice: number;
+  purchasable: boolean;
+  detail: string;
+};
+
 export const MEASURE_REFERENCES: { name: string; w: number; d: number; h: number }[] = [
   { name: "4×8 sheet", w: 96, d: 48, h: 0.75 },
   { name: "Door", w: 32, d: 1.75, h: 80 },
@@ -119,6 +209,9 @@ export type FullProject = Project & {
   straps: Strap[];
   boards: Board[];
   loads: ShopLoad[];
+  hinges: Hinge[];
+  hingeSwing: HingeSwing[];
+  doors: Door[];
 };
 
 function cleanStraps(raw: Strap[] | undefined): Strap[] {
@@ -133,6 +226,108 @@ function cleanStraps(raw: Strap[] | undefined): Strap[] {
   return out;
 }
 
+function cleanHinges(raw: Hinge[] | undefined): Hinge[] {
+  if (!Array.isArray(raw)) return [];
+  const out: Hinge[] = [];
+  for (const item of raw) {
+    if (!item || typeof item.id !== "string" || typeof item.memberId !== "string") continue;
+    if (item.kind !== "leaf" && item.kind !== "barrel" && item.kind !== "angle") continue;
+    if (!Number.isFinite(item.at)) continue;
+    out.push({
+      id: item.id,
+      memberId: item.memberId,
+      kind: item.kind,
+      at: Math.max(0, item.at),
+      side: item.side === -1 ? -1 : 1,
+    });
+    if (out.length >= 80) break;
+  }
+  return out;
+}
+
+function cleanDoors(raw: Door[] | undefined, nodes: SketchNode[]): Door[] {
+  if (!Array.isArray(raw)) return [];
+  const ids = new Set(nodes.map((node) => node.id));
+  const out: Door[] = [];
+  for (const item of raw) {
+    if (!item || typeof item.id !== "string" || typeof item.memberId !== "string") continue;
+    if (!ids.has(item.hingeNode) || !ids.has(item.latchNode)) continue;
+    if (!Number.isFinite(item.width) || item.width < 6) continue;
+    const dirX = item.dirX === -1 || item.dirX === 1 ? item.dirX : 0;
+    const dirZ = item.dirZ === -1 || item.dirZ === 1 ? item.dirZ : 0;
+    if (Math.abs(dirX) + Math.abs(dirZ) !== 1) continue;
+    out.push({
+      id: item.id,
+      memberId: item.memberId,
+      width: Math.round(Math.min(96, item.width) * 32) / 32,
+      hingeNode: item.hingeNode,
+      latchNode: item.latchNode,
+      bottomRail: typeof item.bottomRail === "string" ? item.bottomRail : "",
+      topRail: typeof item.topRail === "string" ? item.topRail : "",
+      dirX,
+      dirZ,
+    });
+    if (out.length >= 12) break;
+  }
+  return out;
+}
+
+function cleanSwings(raw: HingeSwing[] | undefined): HingeSwing[] {
+  if (!Array.isArray(raw)) return [];
+  const out: HingeSwing[] = [];
+  for (const item of raw) {
+    if (!item || typeof item.memberId !== "string" || !Number.isFinite(item.deg)) continue;
+    const deg = Math.round(Math.min(170, Math.max(0, item.deg)));
+    if (deg <= 0) continue;
+    out.push({ memberId: item.memberId, deg });
+    if (out.length >= 40) break;
+  }
+  return out;
+}
+
+function cleanPast(n: unknown): number {
+  if (typeof n !== "number" || !Number.isFinite(n)) return 0;
+  return Math.min(96, Math.max(0, Math.round(n * 32) / 32));
+}
+
+function cleanCut(raw: unknown): "vertical" | "horizontal" | undefined {
+  return raw === "vertical" || raw === "horizontal" ? raw : undefined;
+}
+
+/** Split height, or null when this node is one piece of pipe. */
+export function postSplit(node: SketchNode): number | null {
+  if (node.host || node.tip) return null;
+  if (typeof node.split !== "number" || !Number.isFinite(node.split)) return null;
+  const split = Math.round(node.split * 32) / 32;
+  if (split <= 1 || split >= node.height - 1) return null;
+  return split;
+}
+
+/** Height where a post leaves the floor. Door stiles start higher. */
+export function postFoot(node: SketchNode): number {
+  if (node.host || node.tip) return 0;
+  if (typeof node.base !== "number" || !Number.isFinite(node.base)) return 0;
+  const base = Math.round(node.base * 32) / 32;
+  if (base <= 0.5 || base >= node.height - 1) return 0;
+  return base;
+}
+
+function cleanPlugs(raw: unknown): Plug[] {
+  if (!Array.isArray(raw)) return [];
+  const out: Plug[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const plug = item as Plug;
+    if (typeof plug.id !== "string") continue;
+    const top = plug.top === true;
+    const foot = plug.foot === true;
+    if (!top && !foot) continue;
+    out.push({ id: plug.id, top: top || undefined, foot: foot || undefined });
+    if (out.length >= 80) break;
+  }
+  return out;
+}
+
 export function normalizeProject(project: Project): FullProject {
   const levels = project.levels ?? [];
   const railHeight = Number.isFinite(project.railHeight)
@@ -140,13 +335,46 @@ export function normalizeProject(project: Project): FullProject {
     : levels.length
       ? levels[levels.length - 1]
       : Math.max(8, (project.postHeight ?? 36) - 1);
-  const nodes = (Array.isArray(project.nodes) ? project.nodes : []).map((node) => ({
-    ...node,
-    bury: Number.isFinite(node.bury) ? Math.max(0, node.bury as number) : 0,
-  }));
-  const links = (Array.isArray(project.links) ? project.links : []).map((link) =>
-    link.kind === "brace" ? { ...link, kind: "rail" as const } : link,
-  );
+  const nodes = (Array.isArray(project.nodes) ? project.nodes : []).map((node) => {
+    const tip = node.tip === true && !node.host;
+    const height = Number.isFinite(node.height) ? (node.height as number) : 0;
+    const door = typeof node.door === "string" && node.door ? node.door : undefined;
+    let base: number | undefined;
+    if (!tip && !node.host && typeof node.base === "number" && Number.isFinite(node.base)) {
+      const next = Math.round(node.base * 32) / 32;
+      if (next > 0.5 && next < height - 1) base = next;
+    }
+    let split: number | undefined;
+    if (!tip && !node.host && !door && typeof node.split === "number" && Number.isFinite(node.split)) {
+      const next = Math.round(node.split * 32) / 32;
+      if (next > 1 && next < height - 1) split = next;
+    }
+    return {
+      ...node,
+      bury: tip || door ? 0 : Number.isFinite(node.bury) ? Math.max(0, node.bury as number) : 0,
+      flange: tip || door ? false : node.flange,
+      tip: tip || undefined,
+      split,
+      base,
+      door,
+      cap: !tip && node.cap === true ? true : undefined,
+      capFoot: !tip && !door && node.capFoot === true ? true : undefined,
+    };
+  });
+  const links = (Array.isArray(project.links) ? project.links : []).map((link) => {
+    const pastA = cleanPast(link.pastA);
+    const pastB = cleanPast(link.pastB);
+    return {
+      ...link,
+      kind: link.kind === "brace" ? ("rail" as const) : link.kind,
+      pastA: pastA > 0 ? pastA : undefined,
+      pastB: pastB > 0 ? pastB : undefined,
+      capA: link.capA === true ? true : undefined,
+      capB: link.capB === true ? true : undefined,
+      cutA: cleanCut(link.cutA),
+      cutB: cleanCut(link.cutB),
+    };
+  });
   const seated = reseatHosts(nodes, links);
   const boards = cleanBoards((project as Project & { boards?: unknown }).boards);
   const floor: FloorKind = project.floor === "grass" || project.floor === "dirt" || project.floor === "wood" ? project.floor : "concrete";
@@ -157,7 +385,11 @@ export function normalizeProject(project: Project): FullProject {
     straps: cleanStraps(project.straps),
     boards,
     loads: [],
+    hinges: cleanHinges(project.hinges),
+    hingeSwing: cleanSwings(project.hingeSwing),
+    doors: cleanDoors(project.doors, seated.nodes),
     braces: false,
+    plugs: cleanPlugs(project.plugs),
     stick: project.stick === 96 || project.stick === 240 ? project.stick : 120,
     links: seated.links,
     nodes: seated.nodes,
@@ -238,6 +470,10 @@ export type Member = {
   /** Clamp this end seats in, when the cut is shortened. */
   seatA: string;
   seatB: string;
+  /** MakerPipe plugs on the exposed ends of this pipe. */
+  caps: number;
+  /** Where those plugs sit, and which way is out of the pipe. */
+  capAt: { at: Vec3; axis: Vec3 }[];
 };
 
 export type Branch = { dir: Vec3; setback: number; outer: number; inner: number };
@@ -253,7 +489,7 @@ export type Fitting = {
   trade?: TradeId;
   /** Extra 3/4"-to-1/2" shims when a 3/4" clamp grabs a 1/2" pipe. */
   extraHalfShims?: number;
-  /** 1"-to-3/4" shims when a 1" clamp grabs a smaller pipe. */
+  /** 1"-to-3/4" shims. One per 3/4" pipe a 1" clamp grabs. 1/2" is not a published fit. */
   extraOneShims?: number;
   /** Through-pipe direction. Omitted means the post, straight up. */
   axis?: Vec3;
@@ -319,6 +555,12 @@ export type Build = {
   /** One-hole straps that landed on a real pipe, clamped onto the metal. */
   straps: Strap[];
   strapCost: number;
+  /** Hinges that landed on a real post or rail. */
+  hinges: Hinge[];
+  hardware: HardwareLine[];
+  /** End plugs grouped by EMT size. */
+  caps: { trade: TradeId; label: string; qty: number; unitPrice: number; packPrice: number }[];
+  capCost: number;
   width: AxisMeasure;
   depth: AxisMeasure;
   postHeight: number;
@@ -490,14 +732,25 @@ function makeMember(opts: {
   trade?: TradeId;
   seatA?: string;
   seatB?: string;
+  pastA?: number;
+  pastB?: number;
+  capA?: boolean;
+  capB?: boolean;
 }): Member {
   const span = vlen(sub(opts.b, opts.a));
   const dir = norm(sub(opts.b, opts.a));
-  const metal = span - opts.setbackA - opts.setbackB;
-  const start = at(opts.a, dir, opts.setbackA);
-  const end = at(opts.a, dir, Math.max(opts.setbackA, span - opts.setbackB));
+  const pastA = Math.max(0, opts.pastA ?? 0);
+  const pastB = Math.max(0, opts.pastB ?? 0);
+  const trimA = opts.setbackA - pastA;
+  const trimB = opts.setbackB - pastB;
+  const metal = span - trimA - trimB;
+  const start = at(opts.a, dir, trimA);
+  const end = at(opts.a, dir, Math.max(trimA + 0.05, span - trimB));
   const planned = planPieces(metal, opts.stick, opts.gap);
   const laid = metal > 0.05 ? layoutPieces(start, end, planned.pieces, opts.gap) : { segments: [], couplings: [] };
+  const capAt: { at: Vec3; axis: Vec3 }[] = [];
+  if (opts.capA) capAt.push({ at: start, axis: scale(dir, -1) });
+  if (opts.capB) capAt.push({ at: end, axis: dir });
   return {
     id: opts.id,
     kind: opts.kind,
@@ -517,6 +770,8 @@ function makeMember(opts: {
     setbackB: opts.setbackB,
     seatA: opts.seatA ?? "",
     seatB: opts.seatB ?? "",
+    caps: capAt.length,
+    capAt,
   };
 }
 
@@ -676,6 +931,20 @@ export function snapSketch(x: number, z: number, nodes: SketchNode[]): { x: numb
   if (!lockX) sx = Math.round(x);
   if (!lockZ) sz = Math.round(z);
   return { x: round32(sx), z: round32(sz), lockX, lockZ };
+}
+
+/** An open rail end lands on a square axis from the post it starts at. Turn it after it is placed. */
+export function squareFrom(from: { x: number; z: number }, x: number, z: number): { x: number; z: number } {
+  const dx = x - from.x;
+  const dz = z - from.z;
+  if (Math.abs(dx) >= Math.abs(dz)) return { x: round32(x), z: round32(from.z) };
+  return { x: round32(from.x), z: round32(z) };
+}
+
+/** Plan angle of a rail, degrees. 0 runs along +X (the width). 90 runs along +Z (the depth). */
+export function planAngle(a: { x: number; z: number }, b: { x: number; z: number }): number {
+  const deg = (Math.atan2(b.z - a.z, b.x - a.x) * 180) / Math.PI;
+  return Math.round((((deg % 360) + 360) % 360) * 10) / 10;
 }
 
 /** Height of a sketch pipe at each post. A missing second height means the pipe is level. */
@@ -842,10 +1111,32 @@ function cardinalDir(dx: number, dz: number): Dir | null {
   return null;
 }
 
+function oppositeDir(dir: Dir): Dir {
+  if (dir === "+x") return "-x";
+  if (dir === "-x") return "+x";
+  if (dir === "+z") return "-z";
+  return "+z";
+}
+
 function largerTrade(ids: TradeId[]): TradeId {
   if (ids.includes("one")) return "one";
   if (ids.includes("three-quarter")) return "three-quarter";
   return "half";
+}
+
+/** Shims a clamp needs for the pipes it actually grabs. A 1" clamp on 3/4" EMT takes one 1" shim per pipe. 1/2" into a 1" clamp is not a MakerPipe fit. */
+function grabShims(joint: TradeId, pipes: TradeId[]): { extraHalfShims: number; extraOneShims: number } {
+  return {
+    extraHalfShims: joint === "three-quarter" ? pipes.filter((pipe) => pipe === "half").length : 0,
+    extraOneShims: joint === "one" ? pipes.filter((pipe) => pipe === "three-quarter").length : 0,
+  };
+}
+
+const ONE_ON_HALF =
+  'A 1" clamp is on 1/2" EMT. MakerPipe doesn\'t sell a shim for that. Use 3/4" tube with a 1" to 3/4" shim, or stay on 1" tube.';
+
+function noteOneOnHalf(issues: Issue[], joint: TradeId, pipes: TradeId[]) {
+  if (joint === "one" && pipes.includes("half")) issues.push({ severity: "warn", text: ONE_ON_HALF });
 }
 
 function dot(a: Vec3, b: Vec3): number {
@@ -945,7 +1236,7 @@ function splitMetal(member: Member, fracs: number[], stick: number, gap: number)
   member.couplingCount = couplings;
 }
 
-function applyCrossings(project: FullProject, rails: Member[], fittings: Fitting[]) {
+function applyCrossings(project: FullProject, rails: Member[], fittings: Fitting[], issues: Issue[]) {
   const pending = new Map<string, number[]>();
   const seen = new Set<string>();
   const linkOf = (member: Member) => project.links.find((link) => member.id === `rail:${link.id}`);
@@ -984,9 +1275,9 @@ function applyCrossings(project: FullProject, rails: Member[], fittings: Fitting
         purchasable: CONNECTOR_MAP.cross.trades.includes(clamp),
         approx: false,
         trade: clamp,
-        extraHalfShims: clamp === "three-quarter" ? [ta, tb].filter((t) => t === "half").length : 0,
-        extraOneShims: clamp === "one" ? [ta, tb].filter((t) => t !== "one").length : 0,
+        ...grabShims(clamp, [ta, tb]),
       });
+      noteOneOnHalf(issues, clamp, [ta, tb]);
       const qa = pending.get(ri.id) ?? [];
       qa.push(fa);
       pending.set(ri.id, qa);
@@ -1003,16 +1294,84 @@ function applyCrossings(project: FullProject, rails: Member[], fittings: Fitting
   }
 }
 
+type ThroughPick = {
+  linkId: string;
+  end: "a" | "b";
+  nodeId: string;
+  y: number;
+  trade: TradeId;
+  dir: Vec3;
+  past: number;
+};
+
+/** One rail may run through a split post. Every other rail at that height is left off. */
+function collectThrough(project: FullProject, byId: Map<string, SketchNode>, issues: Issue[], nameOf: Map<string, string>): Map<string, ThroughPick> {
+  const cands = new Map<string, ThroughPick[]>();
+  for (const link of project.links) {
+    if (link.kind !== "rail") continue;
+    const a = byId.get(link.a);
+    const b = byId.get(link.b);
+    if (!a || !b || a.id === b.id) continue;
+    const dx = b.x - a.x;
+    const dz = b.z - a.z;
+    const stored = endHeights(link);
+    const ya = a.host || a.tip ? (a.tip ? stored[0] : a.height) : stored[0];
+    const yb = b.host || b.tip ? (b.tip ? stored[1] : b.height) : stored[1];
+    if (Math.abs(ya - yb) > 1 / 16) continue;
+    if (!cardinalDir(dx, dz)) continue;
+    const len = Math.hypot(dx, dz) || 1;
+    const dir: Vec3 = [dx / len, 0, dz / len];
+    const pipe = link.trade ?? project.trade;
+    const consider = (end: "a" | "b", node: SketchNode, y: number) => {
+      if (node.tip || node.host || y > node.height + 0.05) return;
+      const cut = end === "a" ? link.cutA : link.cutB;
+      if (cut === "horizontal") return;
+      const stored = postSplit(node);
+      const split = stored ?? (cut === "vertical" && y > 1 && y < node.height - 1 ? Math.round(y * 32) / 32 : null);
+      if (split == null || Math.abs(y - split) > 0.75) return;
+      const past = end === "a" ? cleanPast(link.pastA) : cleanPast(link.pastB);
+      const list = cands.get(node.id) ?? [];
+      list.push({ linkId: link.id, end, nodeId: node.id, y, trade: pipe, dir, past });
+      cands.set(node.id, list);
+    };
+    consider("a", a, ya);
+    consider("b", b, yb);
+  }
+  const chosen = new Map<string, ThroughPick>();
+  for (const [nodeId, list] of cands) {
+    const best = [...list].sort((p, q) => Number(q.past > 0.05) - Number(p.past > 0.05))[0];
+    chosen.set(nodeId, best);
+    if (list.length > 1) {
+      issues.push({
+        severity: "warn",
+        text: `Post ${nameOf.get(nodeId) ?? "?"} is split, so only one rail can run through it. The other rail at that height was left off.`,
+      });
+    }
+  }
+  return chosen;
+}
+
+function withBury(member: Member, bury: number, stick: number, gap: number): Member {
+  if (bury <= 0.05) return member;
+  const metal = member.metal + bury;
+  const planned = planPieces(metal, stick, gap);
+  return { ...member, metal, pieces: planned.pieces, couplingCount: planned.couplings, buried: bury };
+}
+
 function buildSketch(project: FullProject): Build {
   const trade = tradeById(project.trade);
   const family = FAMILIES[trade.family];
   const issues: Issue[] = [];
   const nodes = project.nodes.filter((n) => Number.isFinite(n.x) && Number.isFinite(n.z) && n.height > 1);
   const byId = new Map(nodes.map((n) => [n.id, n]));
-  const real = nodes.filter((n) => !n.host);
+  const real = nodes.filter((n) => !n.host && !n.tip);
   const ordered = [...real].sort((a, b) => a.z - b.z || a.x - b.x);
   const nameOf = new Map(ordered.map((n, i) => [n.id, colName(i)]));
-  for (const node of nodes) if (node.host) nameOf.set(node.id, "joint");
+  for (const node of nodes) {
+    if (node.tip) nameOf.set(node.id, "open end");
+    else if (node.host) nameOf.set(node.id, "joint");
+  }
+  const throughByPost = collectThrough(project, byId, issues, nameOf);
 
   if (real.length === 0) {
     issues.push({
@@ -1020,35 +1379,115 @@ function buildSketch(project: FullProject): Build {
       text: "Free build is empty. Choose Post and click the floor — posts snap to the inch and to each other so the clamps stay square.",
     });
   }
+  if (nodes.some((node) => node.door)) {
+    issues.push({
+      severity: "info",
+      text: "A door is real pipe on the cut list. The hinges hold it — it is not clamped to that post. Straps on the door take lumber, and swinging the hinge swings the door and that lumber.",
+    });
+  }
 
-  const posts: Member[] = real.map((node) => {
+  const posts: Member[] = [];
+  const splitByPost = new Map<string, number>();
+  for (const node of real) {
     const pipe = node.trade ?? project.trade;
     const fam = FAMILIES[tradeById(pipe).family];
     const bury = Math.max(0, node.bury ?? 0);
-    const member = makeMember({
-      id: `post:${node.id}`,
-      kind: "post",
-      label: `Post ${nameOf.get(node.id)}`,
-      a: [node.x, 0, node.z],
-      b: [node.x, node.height, node.z],
-      setbackA: 0,
-      setbackB: 0,
-      stick: project.stick,
-      gap: fam.coupleGap,
-      approx: false,
-      trade: node.trade,
-    });
-    if (bury <= 0.05) return member;
-    const metal = member.span + bury;
-    const planned = planPieces(metal, project.stick, fam.coupleGap);
-    return { ...member, metal, pieces: planned.pieces, couplingCount: planned.couplings, buried: bury };
-  });
+    const through = throughByPost.get(node.id);
+    const storedSplit = postSplit(node);
+    const split =
+      storedSplit ??
+      (through && through.y > 1 && through.y < node.height - 1 ? Math.round(through.y * 32) / 32 : null);
+    if (split != null) splitByPost.set(node.id, split);
+    const joint = through ? largerTrade([pipe, through.trade]) : pipe;
+    const inline = FAMILIES[tradeById(joint).family].inline.setback;
+    const footCap = node.capFoot === true && !node.flange && bury < 0.05;
+    const topCap = node.cap === true;
+    if (split == null) {
+      posts.push(
+        withBury(
+          makeMember({
+            id: `post:${node.id}`,
+            kind: "post",
+            label: `Post ${nameOf.get(node.id)}`,
+            a: [node.x, postFoot(node), node.z],
+            b: [node.x, node.height, node.z],
+            setbackA: 0,
+            setbackB: 0,
+            stick: project.stick,
+            gap: fam.coupleGap,
+            approx: false,
+            trade: node.trade,
+            capA: footCap,
+            capB: topCap,
+          }),
+          bury,
+          project.stick,
+          fam.coupleGap,
+        ),
+      );
+      continue;
+    }
+    if (!through) {
+      issues.push({
+        severity: "warn",
+        text: `Post ${nameOf.get(node.id)} is split at ${formatDecimal(split)}, but no rail runs through it. The two pieces need that rail and a 180° clamp.`,
+      });
+    }
+    if (split - inline < 0.75 || node.height - split - inline < 0.75) {
+      issues.push({
+        severity: "warn",
+        text: `Post ${nameOf.get(node.id)} doesn't leave enough pipe on both sides of the split for the 180° clamp.`,
+      });
+    }
+    posts.push(
+      withBury(
+        makeMember({
+          id: `post:${node.id}`,
+          kind: "post",
+          label: `Post ${nameOf.get(node.id)} lower`,
+          a: [node.x, 0, node.z],
+          b: [node.x, split, node.z],
+          setbackA: 0,
+          setbackB: inline,
+          seatB: "180°",
+          stick: project.stick,
+          gap: fam.coupleGap,
+          approx: false,
+          trade: node.trade,
+          capA: footCap,
+          capB: false,
+        }),
+        bury,
+        project.stick,
+        fam.coupleGap,
+      ),
+    );
+    posts.push(
+      makeMember({
+        id: `post:${node.id}:hi`,
+        kind: "post",
+        label: `Post ${nameOf.get(node.id)} upper`,
+        a: [node.x, split, node.z],
+        b: [node.x, node.height, node.z],
+        setbackA: inline,
+        setbackB: 0,
+        seatA: "180°",
+        stick: project.stick,
+        gap: fam.coupleGap,
+        approx: false,
+        trade: node.trade,
+        capA: false,
+        capB: topCap,
+      }),
+    );
+  }
 
-  type End = { linkId: string; end: "a" | "b"; nodeId: string; dir: Dir; y: number; trade: TradeId };
+  type End = { linkId: string; end: "a" | "b"; nodeId: string; dir: Dir; y: number; trade: TradeId; phantom?: boolean };
   const ends: End[] = [];
   const hostEnds: End[] = [];
   const diagonal = new Set<string>();
   const hingeEnd = new Set<string>();
+  const stubPlans = new Map<string, { nodeId: string; dir: Dir; y: number; past: number }>();
 
   for (const link of project.links) {
     if (link.kind !== "rail") continue;
@@ -1061,7 +1500,7 @@ function buildSketch(project: FullProject): Build {
     const ya = a.host ? a.height : stored[0];
     const yb = b.host ? b.height : stored[1];
     if (Math.hypot(dx, dz, ya - yb) < 0.5) continue;
-    if ((!a.host && ya > a.height + 0.05) || (!b.host && yb > b.height + 0.05)) {
+    if ((!a.host && !a.tip && ya > a.height + 0.05) || (!b.host && !b.tip && yb > b.height + 0.05)) {
       issues.push({
         severity: "warn",
         text: `Rail ${nameOf.get(a.id)}–${nameOf.get(b.id)} is above one of the posts, so it was left off.`,
@@ -1076,12 +1515,63 @@ function buildSketch(project: FullProject): Build {
       continue;
     }
     const push = (end: "a" | "b", node: SketchNode, dir: Dir, y: number) => {
+      if (node.tip) return;
+      const cut = end === "a" ? link.cutA : link.cutB;
+      const through = throughByPost.get(node.id);
+      const split = splitByPost.get(node.id) ?? null;
+      if (cut === "horizontal") {
+        if (!node.host && split != null && Math.abs(y - split) <= 0.75) {
+          issues.push({
+            severity: "warn",
+            text: `Post ${nameOf.get(node.id)} is already two pieces at this rail, so the rail stays in the saddle.`,
+          });
+          return;
+        }
+      } else if (through && through.linkId === link.id && through.end === end) {
+        return;
+      } else if (!node.host && split != null && Math.abs(y - split) <= 0.75) {
+        return;
+      }
       const rec: End = { linkId: link.id, end, nodeId: node.id, dir, y, trade: pipe };
       if (node.host && node.host !== link.id) hostEnds.push(rec);
       else ends.push(rec);
     };
     push("a", a, da, ya);
     push("b", b, db, yb);
+  }
+
+  for (const link of project.links) {
+    if (link.kind !== "rail") continue;
+    for (const end of ["a", "b"] as const) {
+      if ((end === "a" ? link.cutA : link.cutB) !== "horizontal") continue;
+      const real = ends.find((item) => item.linkId === link.id && item.end === end && !item.phantom);
+      if (!real) continue;
+      const yKey = Math.round(real.y * 32);
+      const crowded = ends.some(
+        (item) =>
+          item.nodeId === real.nodeId &&
+          Math.round(item.y * 32) === yKey &&
+          item.dir === real.dir &&
+          item.linkId !== real.linkId,
+      );
+      if (crowded) continue;
+      const opp = oppositeDir(real.dir);
+      const taken = ends.some(
+        (item) => item.nodeId === real.nodeId && Math.round(item.y * 32) === yKey && item.dir === opp,
+      );
+      const past = end === "a" ? cleanPast(link.pastA) : cleanPast(link.pastB);
+      if (taken) {
+        if (past > 0.05) {
+          issues.push({
+            severity: "info",
+            text: `Another pipe already continues past post ${nameOf.get(real.nodeId) ?? "?"}, so this rail doesn't stick out there.`,
+          });
+        }
+        continue;
+      }
+      ends.push({ ...real, dir: opp, phantom: true });
+      stubPlans.set(`${link.id}:${end}`, { nodeId: real.nodeId, dir: opp, y: real.y, past });
+    }
   }
 
   const fittings: Fitting[] = [];
@@ -1130,20 +1620,27 @@ function buildSketch(project: FullProject): Build {
       purchasable: CONNECTOR_MAP[sku].trades.includes(joint),
       approx: false,
       trade: joint,
-      extraHalfShims: joint === "three-quarter" ? pipes.filter((pipe) => pipe === "half").length : 0,
-      extraOneShims: joint === "one" ? pipes.filter((pipe) => pipe !== "one").length : 0,
+      ...grabShims(joint, pipes),
     });
+    noteOneOnHalf(issues, joint, pipes);
     for (const end of kept) {
+      if (end.phantom) continue;
       const spec = armSpec(jointFamily, dirs, end.dir);
       setbacks.set(`${end.linkId}:${end.end}`, { ...spec, approx: false, seat: skuShort(sku) });
     }
-    if (!node.host && y < 1.25) {
+    if (!node.host && y - postFoot(node) < 1.25) {
       issues.push({
         severity: "warn",
-        text: `A rail at ${formatDecimal(y)} on post ${nameOf.get(node.id)} sits too close to the floor for the clamp to bite. Leave about 1" of pipe past the fitting.`,
+        text: `A rail at ${formatDecimal(y)} on post ${nameOf.get(node.id)} sits too close to the ${postFoot(node) > 0.5 ? "end of the pipe" : "floor"} for the clamp to bite. Leave about 1" of pipe past the fitting.`,
       });
     }
-    if (!node.host && node.height - y < 1) {
+    const split = splitByPost.get(node.id) ?? null;
+    if (!node.host && split != null && y < split - 0.05 && split - y < 1) {
+      issues.push({
+        severity: "warn",
+        text: `Post ${nameOf.get(node.id)} doesn't have an inch of pipe between the rail at ${formatDecimal(y)} and the split.`,
+      });
+    } else if (!node.host && node.height - y < 1 && (split == null || y > split + 0.05)) {
       issues.push({
         severity: "warn",
         text: `Post ${nameOf.get(node.id)} doesn't have an inch of pipe above the rail at ${formatDecimal(y)}. The through-clamp needs that stub.`,
@@ -1191,13 +1688,48 @@ function buildSketch(project: FullProject): Build {
       purchasable: CONNECTOR_MAP[sku].trades.includes(joint),
       approx: false,
       trade: joint,
-      extraHalfShims: joint === "three-quarter" ? pipes.filter((pipe) => pipe === "half").length : 0,
-      extraOneShims: joint === "one" ? pipes.filter((pipe) => pipe !== "one").length : 0,
+      ...grabShims(joint, pipes),
     });
+    noteOneOnHalf(issues, joint, pipes);
     for (const end of kept) {
       const spec = armSpec(jointFamily, dirs, end.dir);
       setbacks.set(`${end.linkId}:${end.end}`, { ...spec, approx: false, seat: skuShort(sku) });
     }
+  }
+
+  for (const through of throughByPost.values()) {
+    const node = byId.get(through.nodeId);
+    if (!node) continue;
+    const split = splitByPost.get(node.id) ?? null;
+    if (split == null) continue;
+    const postTrade = node.trade ?? project.trade;
+    const pipes = [postTrade, postTrade, through.trade];
+    const joint = largerTrade(pipes);
+    const spec = FAMILIES[tradeById(joint).family].inline;
+    noteOneOnHalf(issues, joint, pipes);
+    const clash = fittings.some(
+      (fitting) => Math.hypot(fitting.position[0] - node.x, fitting.position[2] - node.z) < 0.5 && Math.abs(fitting.position[1] - split) < 2.1,
+    );
+    if (clash) {
+      issues.push({
+        severity: "warn",
+        text: `The 180° on post ${nameOf.get(node.id)} sits on another clamp. Keep clamp centers at least 2 1/4" apart.`,
+      });
+    }
+    fittings.push({
+      id: `fit:${node.id}:${Math.round(split * 32)}`,
+      sku: "180",
+      position: [node.x, split, node.z],
+      axis: through.dir,
+      branches: [
+        { dir: [0, 1, 0], setback: spec.setback, outer: spec.outer, inner: spec.inner },
+        { dir: [0, -1, 0], setback: spec.setback, outer: spec.outer, inner: spec.inner },
+      ],
+      purchasable: CONNECTOR_MAP["180"].trades.includes(joint),
+      approx: false,
+      trade: joint,
+      ...grabShims(joint, pipes),
+    });
   }
 
   const rails: Member[] = [];
@@ -1211,16 +1743,26 @@ function buildSketch(project: FullProject): Build {
     const stored = endHeights(link);
     const ya = a.host ? a.height : stored[0];
     const yb = b.host ? b.height : stored[1];
-    if ((!a.host && ya > a.height + 0.05) || (!b.host && yb > b.height + 0.05)) continue;
+    if ((!a.host && !a.tip && ya > a.height + 0.05) || (!b.host && !b.tip && yb > b.height + 0.05)) continue;
     const run = Math.hypot(b.x - a.x, b.z - a.z);
     if (Math.hypot(run, ya - yb) < 0.5) continue;
     const sloped = Math.abs(ya - yb) > 1 / 16;
     const keyA = `${link.id}:a`;
     const keyB = `${link.id}:b`;
     const linkFam = FAMILIES[tradeById(link.trade ?? project.trade).family];
+    const throughA = throughByPost.get(a.id);
+    const throughB = throughByPost.get(b.id);
+    const tipA = a.tip === true;
+    const tipB = b.tip === true;
+    const passA = Boolean(throughA && throughA.linkId === link.id && throughA.end === "a");
+    const passB = Boolean(throughB && throughB.linkId === link.id && throughB.end === "b");
+    const pastA = passA && link.cutA !== "horizontal" ? cleanPast(link.pastA) : 0;
+    const pastB = passB && link.cutB !== "horizontal" ? cleanPast(link.pastB) : 0;
+    const openSpec = { setback: 0, outer: 0, inner: 0, approx: false, seat: "open" };
+    const throughSpec = { setback: 0, outer: 0, inner: 0, approx: false, seat: "180°" };
     const hingeFor = { setback: linkFam.braceSetback, outer: linkFam.T.outer, inner: linkFam.T.inner, approx: true, seat: "hinge" };
-    const specA = setbacks.get(keyA) ?? (diagonal.has(link.id) || hingeEnd.has(keyA) ? hingeFor : null);
-    const specB = setbacks.get(keyB) ?? (diagonal.has(link.id) || hingeEnd.has(keyB) ? hingeFor : null);
+    const specA = tipA ? openSpec : passA ? throughSpec : (setbacks.get(keyA) ?? (diagonal.has(link.id) || hingeEnd.has(keyA) ? hingeFor : null));
+    const specB = tipB ? openSpec : passB ? throughSpec : (setbacks.get(keyB) ?? (diagonal.has(link.id) || hingeEnd.has(keyB) ? hingeFor : null));
     if (!specA || !specB) continue;
     const approx = specA.approx || specB.approx || diagonal.has(link.id);
     if (diagonal.has(link.id)) {
@@ -1229,21 +1771,28 @@ function buildSketch(project: FullProject): Build {
       const angB = meetAngle(throughAxis(b, byId, project.links), sub([a.x, ya, a.z], [b.x, yb, b.z]));
       const skuA = Math.abs(angA - 45) <= 3 ? "45" : "hinge";
       const skuB = Math.abs(angB - 45) <= 3 ? "45" : "hinge";
-      specA.seat = skuA === "45" ? "45°" : "hinge";
-      specB.seat = skuB === "45" ? "45°" : "hinge";
-      const pushAngle = (end: "a" | "b", sku: "45" | "hinge", at: Vec3, aim: Vec3, axis: Vec3) => {
+      specA.seat = a.tip ? "open" : skuA === "45" ? "45°" : "hinge";
+      specB.seat = b.tip ? "open" : skuB === "45" ? "45°" : "hinge";
+      const pushAngle = (end: "a" | "b", sku: "45" | "hinge", node: SketchNode, at: Vec3, aim: Vec3, axis: Vec3) => {
+        if (node.tip) return;
+        const through = node.host ? (project.links.find((item) => item.id === node.host)?.trade ?? project.trade) : (node.trade ?? project.trade);
+        const pipes = [through, link.trade ?? project.trade];
+        const joint = largerTrade(pipes);
+        noteOneOnHalf(issues, joint, pipes);
         fittings.push({
           id: `hinge:${link.id}:${end}`,
           sku,
           position: at,
           axis,
           branches: [{ dir: aim, setback: linkFam.braceSetback, outer: linkFam.T.outer, inner: linkFam.T.inner }],
-          purchasable: true,
+          purchasable: CONNECTOR_MAP[sku].trades.includes(joint),
           approx: sku !== "45",
+          trade: joint,
+          ...grabShims(joint, pipes),
         });
       };
-      pushAngle("a", skuA, [a.x, ya, a.z], dir, throughAxis(a, byId, project.links));
-      pushAngle("b", skuB, [b.x, yb, b.z], scale(dir, -1), throughAxis(b, byId, project.links));
+      pushAngle("a", skuA, a, [a.x, ya, a.z], dir, throughAxis(a, byId, project.links));
+      pushAngle("b", skuB, b, [b.x, yb, b.z], scale(dir, -1), throughAxis(b, byId, project.links));
       if (!diagonalNoted) {
         diagonalNoted = true;
         issues.push({
@@ -1259,14 +1808,20 @@ function buildSketch(project: FullProject): Build {
         const oy = end === "a" ? yb : ya;
         const ny = end === "a" ? ya : yb;
         const dir = norm([other.x - node.x, oy - ny, other.z - node.z]);
+        const through = node.host ? (project.links.find((item) => item.id === node.host)?.trade ?? project.trade) : (node.trade ?? project.trade);
+        const pipes = [through, link.trade ?? project.trade];
+        const joint = largerTrade(pipes);
+        noteOneOnHalf(issues, joint, pipes);
         fittings.push({
           id: `hinge:${link.id}:${end}`,
           sku: "hinge",
           position: [node.x, ny, node.z],
           axis: throughAxis(node, byId, project.links),
           branches: [{ dir, setback: linkFam.braceSetback, outer: linkFam.T.outer, inner: linkFam.T.inner }],
-          purchasable: true,
+          purchasable: CONNECTOR_MAP.hinge.trades.includes(joint),
           approx: true,
+          trade: joint,
+          ...grabShims(joint, pipes),
         });
       }
     }
@@ -1307,20 +1862,64 @@ function buildSketch(project: FullProject): Build {
         approx,
         trade: link.trade,
         angle: sloped ? (Math.atan2(yb - ya, run) * 180) / Math.PI : null,
+        pastA,
+        pastB,
+        capA: (tipA && link.capA === true) || (pastA > 0.05 && link.capA === true),
+        capB: (tipB && link.capB === true) || (pastB > 0.05 && link.capB === true),
       }),
     );
+    const pushStub = (end: "a" | "b", node: SketchNode, yEnd: number) => {
+      const plan = stubPlans.get(`${link.id}:${end}`);
+      if (!plan || node.id !== plan.nodeId) return;
+      const spec = setbacks.get(`${link.id}:${end}`);
+      if (!spec) return;
+      const name = nameOf.get(node.id) ?? "?";
+      if (plan.past - spec.setback < 0.75) {
+        issues.push({
+          severity: "warn",
+          text: `The piece of rail past post ${name} is shorter than the clamp. Leave at least an inch or two past the fitting.`,
+        });
+      }
+      if (plan.past - spec.setback <= 0.05) return;
+      const away = DIR_VEC[plan.dir];
+      const origin: Vec3 = [node.x, yEnd, node.z];
+      const far: Vec3 = [origin[0] + away[0] * plan.past, yEnd, origin[2] + away[2] * plan.past];
+      const cap = end === "a" ? link.capA === true : link.capB === true;
+      rails.push(
+        makeMember({
+          id: `rail:${link.id}:stub${end === "a" ? "A" : "B"}`,
+          kind: "rail",
+          label: `Rail past post ${name}`,
+          a: origin,
+          b: far,
+          setbackA: spec.setback,
+          setbackB: 0,
+          seatA: spec.seat,
+          seatB: "open",
+          stick: project.stick,
+          gap: linkFam.coupleGap,
+          approx: false,
+          trade: link.trade,
+          capB: cap,
+        }),
+      );
+    };
+    pushStub("a", a, ya);
+    pushStub("b", b, yb);
   }
 
-  applyCrossings(project, rails, fittings);
+  applyCrossings(project, rails, fittings, issues);
 
   const seenGap = new Set<string>();
   for (const node of nodes) {
-    if (node.host) continue;
+    if (node.host || node.tip) continue;
     const ys = project.links
       .filter((l) => l.kind === "rail" && (l.a === node.id || l.b === node.id))
       .map((l) => (l.a === node.id ? endHeights(l)[0] : endHeights(l)[1]))
-      .filter((y) => y <= node.height + 0.05)
-      .sort((a, b) => a - b);
+      .filter((y) => y <= node.height + 0.05);
+    const split = splitByPost.get(node.id) ?? null;
+    if (split != null) ys.push(split);
+    ys.sort((a, b) => a - b);
     for (let i = 1; i < ys.length; i += 1) {
       const gap = ys[i] - ys[i - 1];
       if (gap >= 0.2 && gap < 2.15) {
@@ -1392,22 +1991,24 @@ function buildSketch(project: FullProject): Build {
       }),
     );
     const branchDir = norm(sub(pb, pa));
-    fittings.push({
-      id: `bfit:${link.id}:a`,
-      sku: plan.sku,
-      position: pa,
-      branches: [{ dir: branchDir, setback: sb, outer: family.T.outer, inner: family.T.inner }],
-      purchasable: true,
-      approx: true,
-    });
-    fittings.push({
-      id: `bfit:${link.id}:b`,
-      sku: plan.sku,
-      position: pb,
-      branches: [{ dir: scale(branchDir, -1), setback: sb, outer: family.T.outer, inner: family.T.inner }],
-      purchasable: true,
-      approx: true,
-    });
+    const bracePipe = link.trade ?? project.trade;
+    const pushBrace = (end: "a" | "b", node: SketchNode, pos: Vec3, dir: Vec3) => {
+      const pipes = [node.trade ?? project.trade, bracePipe];
+      const joint = largerTrade(pipes);
+      noteOneOnHalf(issues, joint, pipes);
+      fittings.push({
+        id: `bfit:${link.id}:${end}`,
+        sku: plan.sku,
+        position: pos,
+        branches: [{ dir, setback: sb, outer: family.T.outer, inner: family.T.inner }],
+        purchasable: CONNECTOR_MAP[plan.sku].trades.includes(joint),
+        approx: true,
+        trade: joint,
+        ...grabShims(joint, pipes),
+      });
+    };
+    pushBrace("a", a, pa, branchDir);
+    pushBrace("b", b, pb, scale(branchDir, -1));
   }
   if (braces.length) {
     issues.push({
@@ -1421,13 +2022,16 @@ function buildSketch(project: FullProject): Build {
   for (const node of nodes) {
     if (!node.flange || node.host) continue;
     if (!flangeOk) flangeGhost = true;
+    const postTrade = node.trade ?? project.trade;
     fittings.push({
       id: `flange:${node.id}`,
       sku: "flange",
       position: [node.x, 0, node.z],
       branches: [],
-      purchasable: flangeOk,
+      purchasable: CONNECTOR_MAP.flange.trades.includes(postTrade),
       approx: false,
+      trade: postTrade,
+      ...grabShims(postTrade, [postTrade]),
     });
   }
   if (flangeGhost) {
@@ -1668,6 +2272,8 @@ export function buildProject(project: Project): Build {
           stick: project.stick,
           gap: family.coupleGap,
           approx: false,
+          capB: (full.plugs ?? []).some((plug) => plug.id === `post-${ix}-${iz}` && plug.top),
+          capA: !project.flanges && (full.plugs ?? []).some((plug) => plug.id === `post-${ix}-${iz}` && plug.foot),
         }),
       );
     }
@@ -1839,6 +2445,328 @@ function resolveStraps(raw: Strap[] | undefined, members: Member[]): Strap[] {
   return out;
 }
 
+/** Where a hinge may sit. A barrel is 4" tall, so it needs room on both sides. */
+export function hingeWindow(member: Member, kind: HingeKind): [number, number] {
+  const pad = kind === "barrel" ? BARREL_LENGTH / 2 + 0.25 : 1;
+  const lo = Math.min(Math.max(pad, member.setbackA + 0.35), Math.max(pad, member.span / 2));
+  const hi = Math.max(lo, member.span - Math.max(member.setbackB, 0) - pad);
+  return [Math.round(lo * 32) / 32, Math.round(hi * 32) / 32];
+}
+
+/** How far this hinge will swing before it binds. */
+export function hingeOpenMax(kind: HingeKind): number {
+  if (kind === "angle") return 90;
+  if (kind === "barrel") return 170;
+  return 120;
+}
+
+export type DoorFrame = {
+  hinge: { x: number; z: number; base: number; height: number };
+  latch: { x: number; z: number; base: number; height: number };
+  bottom: number;
+  top: number;
+  dirX: number;
+  dirZ: number;
+  width: number;
+};
+
+/** Closed door rectangle hung beside an upright post. Null when the pipe is not upright or the hinges cannot hold a door. */
+export function doorFrame(member: Member, hinges: Hinge[], widthIn: number): DoorFrame | null {
+  const usable = hinges.filter((hinge) => hinge.memberId === member.id && hinge.kind !== "angle");
+  if (!usable.length || member.kind !== "post") return null;
+  const axis = sub(member.b, member.a);
+  const span = vlen(axis) || 1;
+  const up = norm(axis);
+  if (up[1] < 0.92) return null;
+  const side = usable[0].side === -1 ? -1 : 1;
+  let faceX = -axis[2];
+  let faceZ = axis[0];
+  if (faceX * faceX + faceZ * faceZ < 0.04) {
+    faceX = 1;
+    faceZ = 0;
+  }
+  const faceLen = Math.hypot(faceX, faceZ) || 1;
+  faceX = (faceX / faceLen) * side;
+  faceZ = (faceZ / faceLen) * side;
+  if (Math.abs(faceX) >= Math.abs(faceZ)) {
+    faceX = faceX >= 0 ? 1 : -1;
+    faceZ = 0;
+  } else {
+    faceX = 0;
+    faceZ = faceZ >= 0 ? 1 : -1;
+  }
+  let dirX = -faceZ;
+  let dirZ = faceX;
+  if (Math.abs(dirX) >= Math.abs(dirZ)) {
+    dirX = dirX >= 0 ? 1 : -1;
+    dirZ = 0;
+  } else {
+    dirX = 0;
+    dirZ = dirZ >= 0 ? 1 : -1;
+  }
+  const width = Math.round(Math.min(96, Math.max(8, widthIn)) * 32) / 32;
+  const knuckle = usable[0].kind === "barrel" ? 0.85 : 1.55;
+  const ats = usable.map((hinge) => hinge.at).sort((a, b) => a - b);
+  let bottom: number;
+  let top: number;
+  if (ats.length >= 2 && ats[ats.length - 1] - ats[0] >= 8) {
+    bottom = ats[0];
+    top = ats[ats.length - 1];
+  } else {
+    const c = ats[Math.floor(ats.length / 2)];
+    bottom = c - 14;
+    top = c + 14;
+  }
+  bottom = Math.max(2, bottom);
+  top = Math.min(span - 2, top);
+  if (top - bottom < 10) {
+    bottom = Math.max(2, Math.min(bottom, span - 14));
+    top = Math.min(span - 2, bottom + 12);
+  }
+  if (top - bottom < 8) return null;
+  const pad = 1.5;
+  const base = Math.round(Math.max(0.75, bottom - pad) * 32) / 32;
+  const height = Math.round(Math.min(span, top + pad) * 32) / 32;
+  if (height - base < 8) return null;
+  const hx = Math.round((member.a[0] + faceX * knuckle) * 32) / 32;
+  const hz = Math.round((member.a[2] + faceZ * knuckle) * 32) / 32;
+  const lx = Math.round((hx + dirX * width) * 32) / 32;
+  const lz = Math.round((hz + dirZ * width) * 32) / 32;
+  const actual = Math.hypot(lx - hx, lz - hz);
+  if (actual < 6) return null;
+  return {
+    hinge: { x: hx, z: hz, base, height },
+    latch: { x: lx, z: lz, base, height },
+    bottom: Math.round(bottom * 32) / 32,
+    top: Math.round(top * 32) / 32,
+    dirX,
+    dirZ,
+    width: Math.round(actual * 32) / 32,
+  };
+}
+
+function cross3(a: Vec3, b: Vec3): Vec3 {
+  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+}
+
+function rotVec(v: Vec3, axis: Vec3, deg: number): Vec3 {
+  const rad = (deg * Math.PI) / 180;
+  const c = Math.cos(rad);
+  const s = Math.sin(rad);
+  const along = dot(axis, v);
+  const cr = cross3(axis, v);
+  return [v[0] * c + cr[0] * s + axis[0] * along * (1 - c), v[1] * c + cr[1] * s + axis[1] * along * (1 - c), v[2] * c + cr[2] * s + axis[2] * along * (1 - c)];
+}
+
+function rotPoint(p: Vec3, pivot: Vec3, axis: Vec3, deg: number): Vec3 {
+  return add(pivot, rotVec(sub(p, pivot), axis, deg));
+}
+
+/** Nodes that swing with a door: the stiles, plus tips and joints that hang only off them. */
+export function swingingNodeIds(project: FullProject): Set<string> {
+  const swing = new Set(project.nodes.filter((node) => node.door).map((node) => node.id));
+  let guard = 0;
+  let grew = true;
+  while (grew && guard < 8) {
+    grew = false;
+    guard += 1;
+    for (const node of project.nodes) {
+      if (swing.has(node.id)) continue;
+      if (node.host) {
+        const link = project.links.find((item) => item.id === node.host);
+        if (link && swing.has(link.a) && swing.has(link.b)) {
+          swing.add(node.id);
+          grew = true;
+        }
+        continue;
+      }
+      if (!node.tip) continue;
+      const touch = project.links.filter((link) => link.a === node.id || link.b === node.id);
+      if (touch.length && touch.every((link) => swing.has(link.a === node.id ? link.b : link.a))) {
+        swing.add(node.id);
+        grew = true;
+      }
+    }
+  }
+  return swing;
+}
+
+function doorIdFor(project: FullProject, nodeId: string): string | null {
+  const node = project.nodes.find((item) => item.id === nodeId);
+  if (node?.door) return node.door;
+  for (const link of project.links) {
+    const other = link.a === nodeId ? link.b : link.b === nodeId ? link.a : null;
+    if (!other) continue;
+    const mate = project.nodes.find((item) => item.id === other);
+    if (mate?.door) return mate.door;
+  }
+  return null;
+}
+
+/** Draw the door open. Cuts stay at the closed size — swinging does not change a length. */
+export function poseSwung(project: FullProject, build: Build): { members: Member[]; fittings: Fitting[] } {
+  const swing = swingingNodeIds(project);
+  if (!swing.size) return { members: build.members, fittings: build.fittings };
+  const degOf = new Map<string, number>();
+  for (const door of project.doors) {
+    const deg = project.hingeSwing.find((item) => item.memberId === door.memberId)?.deg ?? 0;
+    if (deg > 0.05) degOf.set(door.id, deg);
+  }
+  if (!degOf.size) return { members: build.members, fittings: build.fittings };
+  const pivotOf = new Map<string, Vec3>();
+  for (const door of project.doors) {
+    const hinge = project.nodes.find((node) => node.id === door.hingeNode);
+    if (hinge) pivotOf.set(door.id, [hinge.x, 0, hinge.z]);
+  }
+  const axis: Vec3 = [0, 1, 0];
+  const spinPoint = (doorId: string, point: Vec3): Vec3 => {
+    const deg = degOf.get(doorId);
+    const pivot = pivotOf.get(doorId);
+    if (!deg || !pivot) return point;
+    return rotPoint(point, pivot, axis, deg);
+  };
+  const spinDir = (doorId: string, dir: Vec3): Vec3 => {
+    const deg = degOf.get(doorId);
+    if (!deg) return dir;
+    return rotVec(dir, axis, deg);
+  };
+  const memberDoor = (member: Member): string | null => {
+    if (member.id.startsWith("post:")) {
+      const nodeId = member.id.slice(5).replace(/:hi$/, "");
+      return swing.has(nodeId) ? doorIdFor(project, nodeId) : null;
+    }
+    if (member.id.startsWith("rail:") || member.id.startsWith("brace:")) {
+      const linkId = member.id.slice(member.id.indexOf(":") + 1).replace(/:stub[AB]$/, "");
+      const link = project.links.find((item) => item.id === linkId);
+      if (!link || !swing.has(link.a) || !swing.has(link.b)) return null;
+      return doorIdFor(project, link.a);
+    }
+    return null;
+  };
+  const members = build.members.map((member) => {
+    const doorId = memberDoor(member);
+    if (!doorId || !degOf.has(doorId)) return member;
+    const move = (point: Vec3) => spinPoint(doorId, point);
+    return {
+      ...member,
+      a: move(member.a),
+      b: move(member.b),
+      segments: member.segments.map((seg) => ({ a: move(seg.a), b: move(seg.b) })),
+      couplings: member.couplings.map((seg) => ({ a: move(seg.a), b: move(seg.b) })),
+      capAt: member.capAt.map((cap) => ({ at: move(cap.at), axis: spinDir(doorId, cap.axis) })),
+    };
+  });
+  const fittings = build.fittings.map((fitting) => {
+    let doorId: string | null = null;
+    if (fitting.id.startsWith("fit:") || fitting.id.startsWith("bfit:")) {
+      const rest = fitting.id.slice(fitting.id.indexOf(":") + 1);
+      const nodeId = rest.slice(0, rest.lastIndexOf(":"));
+      if (swing.has(nodeId)) doorId = doorIdFor(project, nodeId);
+    } else if (fitting.id.startsWith("flange:")) {
+      const nodeId = fitting.id.slice(7);
+      if (swing.has(nodeId)) doorId = doorIdFor(project, nodeId);
+    } else if (fitting.id.startsWith("hinge:")) {
+      const linkId = fitting.id.split(":")[1];
+      const link = project.links.find((item) => item.id === linkId);
+      if (link && swing.has(link.a) && swing.has(link.b)) doorId = doorIdFor(project, link.a);
+    }
+    if (!doorId || !degOf.has(doorId)) return fitting;
+    return {
+      ...fitting,
+      position: spinPoint(doorId, fitting.position),
+      axis: fitting.axis ? spinDir(doorId, fitting.axis) : fitting.axis,
+      branches: fitting.branches.map((branch) => ({ ...branch, dir: spinDir(doorId, branch.dir) })),
+    };
+  });
+  return { members, fittings };
+}
+
+function hingeBill(project: Project, members: Member[], issues: Issue[]): { hinges: Hinge[]; lines: HardwareLine[]; halfShims: number; oneShims: number } {
+  const byId = new Map(members.map((member) => [member.id, member]));
+  const hinges: Hinge[] = [];
+  for (const hinge of project.hinges ?? []) {
+    const member = byId.get(hinge.memberId);
+    if (!member || member.kind === "brace" || !(member.span > 1)) continue;
+    const [lo, hi] = hingeWindow(member, hinge.kind);
+    hinges.push({ ...hinge, at: Math.round(Math.min(hi, Math.max(lo, hinge.at)) * 32) / 32 });
+  }
+  const lines: HardwareLine[] = [];
+  let halfShims = 0;
+  let oneShims = 0;
+  const leaf = new Map<TradeId, number>();
+  const angle = new Map<TradeId, number>();
+  let barrels = 0;
+  const barrelNoted = new Set<string>();
+  for (const hinge of hinges) {
+    const member = byId.get(hinge.memberId);
+    if (!member) continue;
+    const trade = member.trade ?? project.trade;
+    if (hinge.kind === "leaf") leaf.set(trade, (leaf.get(trade) ?? 0) + 1);
+    else if (hinge.kind === "angle") angle.set(trade, (angle.get(trade) ?? 0) + 1);
+    else {
+      barrels += 1;
+      if (trade === "one") oneShims += 2;
+      else if (trade === "half") halfShims += 2;
+      if (!barrelNoted.has(member.id)) {
+        barrelNoted.add(member.id);
+        const shim =
+          trade === "one"
+            ? " Each half needs a 1\" to 3/4\" shim, because the barrel is 0.94\" and a 1\" clamp is too big."
+            : trade === "half"
+              ? " Clamp it with 3/4\" connectors. Each of those needs a 3/4\" to 1/2\" shim on the 1/2\" pipe. The barrel itself is too big for a 1/2\" clamp."
+              : " A 3/4\" clamp closes on the 0.94\" barrel. That is 0.018\" over 3/4\" EMT, and MakerPipe does not sell a shim for it.";
+        issues.push({
+          severity: "info",
+          text: `${member.label} is cut for a ${BARREL_LENGTH}" barrel hinge. Take ${BARREL_LENGTH}" out of that stick — the hinge is not conduit.${shim}`,
+        });
+      }
+    }
+  }
+  for (const [trade, count] of leaf) {
+    const sold = trade !== "half";
+    if (!sold) {
+      issues.push({
+        severity: "warn",
+        text: "The EMT conduit hinge set is sold for 3/4\" and 1\" only. A 1/2\" pipe cannot take it.",
+      });
+    }
+    lines.push({
+      id: `leaf-${trade}`,
+      name: trade === project.trade ? "EMT conduit hinge set" : `EMT conduit hinge set · ${tradeById(trade).label}`,
+      qty: Math.ceil(count / LEAF_SET_COUNT),
+      unitPrice: LEAF_SET_PRICE,
+      purchasable: sold,
+      detail: sold
+        ? `A set is ${LEAF_SET_COUNT} offset hinges and the 1/4\" bolts, ${money(LEAF_SET_PRICE)}. Drill through the pipe. This build uses ${count}.`
+        : "Not sold for 1/2\" EMT.",
+    });
+  }
+  if (barrels) {
+    lines.push({
+      id: "barrel",
+      name: "Barrel hinge",
+      qty: barrels,
+      unitPrice: BARREL_PRICE,
+      purchasable: true,
+      detail: `${BARREL_LENGTH}" inline hinge, 0.94\" outside. Clamp a connector on each half. On 1\" EMT that connector needs a shim. On 3/4\" it does not.`,
+    });
+  }
+  for (const [trade, count] of angle) {
+    lines.push({
+      id: `angle-${trade}`,
+      name: trade === project.trade ? "Adjustable angle hinge" : `Adjustable angle hinge · ${tradeById(trade).label}`,
+      qty: count,
+      unitPrice: ANGLE_HINGE_PRICE[trade],
+      purchasable: true,
+      detail:
+        trade === "half"
+          ? "Complete connector. The 1/2\" price includes the adapter shims. Leave the top bolt loose and it folds up to 90° either way."
+          : "Complete connector. Leave the top bolt loose and it folds up to 90°. The face you pick is which way it folds.",
+    });
+  }
+  return { hinges, lines, halfShims, oneShims };
+}
+
 function finishBuild(opts: {
   project: Project;
   trade: ReturnType<typeof tradeById>;
@@ -1943,13 +2871,29 @@ function finishBuild(opts: {
   }
   bom.sort((a, b) => b.qty - a.qty);
 
-  const extraHalf = fittings.reduce((sum, fitting) => sum + (fitting.extraHalfShims ?? 0), 0);
-  const oneShimCount = fittings.reduce((sum, fitting) => sum + (fitting.extraOneShims ?? 0), 0);
+  const hardware = hingeBill(project, members, issues);
+  const extraHalf = fittings.reduce((sum, fitting) => sum + (fitting.extraHalfShims ?? 0), 0) + hardware.halfShims;
+  const oneShimCount = fittings.reduce((sum, fitting) => sum + (fitting.extraOneShims ?? 0), 0) + hardware.oneShims;
   const shimCount = bom.reduce((sum, line) => sum + (line.purchasable ? line.qty * line.shimsEach : 0), 0) + extraHalf;
   const shimCost = shimCount * SHIM_PRICE + oneShimCount * ONE_SHIM_PRICE;
   const straps = resolveStraps(project.straps, members);
   const strapCost = straps.length * STRAP_PRICE;
-  const connectorCost = bom.reduce((sum, line) => sum + (line.purchasable ? line.qty * line.unitPrice : 0), 0) + shimCost + strapCost;
+  const capMap = new Map<TradeId, number>();
+  for (const member of members) {
+    if (!member.caps) continue;
+    const id = member.trade ?? project.trade;
+    capMap.set(id, (capMap.get(id) ?? 0) + member.caps);
+  }
+  const caps = [...capMap.entries()].map(([id, qty]) => ({
+    trade: id,
+    label: tradeById(id).label,
+    qty,
+    unitPrice: capEach(id),
+    packPrice: capPackPrice(id),
+  }));
+  const capCost = cents(caps.reduce((sum, line) => sum + (line.qty * line.packPrice) / CAP_PACK, 0));
+  const hardwareCost = hardware.lines.reduce((sum, line) => sum + (line.purchasable ? line.qty * line.unitPrice : 0), 0);
+  const connectorCost = bom.reduce((sum, line) => sum + (line.purchasable ? line.qty * line.unitPrice : 0), 0) + shimCost + strapCost + capCost + hardwareCost;
 
   const cutMap = new Map<string, CutRow>();
   const mixedPipe = groups.size > 1;
@@ -1999,6 +2943,10 @@ function finishBuild(opts: {
     oneShimCount,
     straps,
     strapCost,
+    hinges: hardware.hinges,
+    hardware: hardware.lines,
+    caps,
+    capCost,
     width,
     depth,
     postHeight,
@@ -2164,7 +3112,7 @@ export type SheetItem = {
   fittingSku: Sku | null;
   /** Set when one sku is bought in more than one EMT size. */
   fittingTradeLabel: string | null;
-  kind: "emt" | "fitting" | "shim" | "strap";
+  kind: "emt" | "fitting" | "shim" | "strap" | "cap" | "hinge";
 };
 
 export type SheetIndex = {
@@ -2241,8 +3189,8 @@ export function sheetIndex(project: Project, build: Build, unit: "in" | "ft" = "
   }
   if (build.oneShimCount > 0) {
     push({
-      name: '1" to 3/4" shim',
-      detail: `${money(ONE_SHIM_PRICE)} each · so a 1" clamp can grab smaller tube`,
+      name: '1" to 3/4" adapter shim',
+      detail: `${money(ONE_SHIM_PRICE)} each · one for every 3/4" pipe a 1" clamp grabs`,
       qty: build.oneShimCount,
       unitPrice: ONE_SHIM_PRICE,
       extension: cents(build.oneShimCount * ONE_SHIM_PRICE),
@@ -2261,6 +3209,30 @@ export function sheetIndex(project: Project, build: Build, unit: "in" | "ft" = "
       fittingSku: null,
       fittingTradeLabel: null,
       kind: "strap",
+    });
+  }
+  for (const line of build.caps) {
+    push({
+      name: `${line.label} end cap`,
+      detail: `${money(line.unitPrice)} each · sold in packs of ${CAP_PACK} for ${money(line.packPrice)}. Taps into an open end.`,
+      qty: line.qty,
+      unitPrice: line.unitPrice,
+      extension: cents((line.qty * line.packPrice) / CAP_PACK),
+      fittingSku: null,
+      fittingTradeLabel: null,
+      kind: "cap",
+    });
+  }
+  for (const line of build.hardware) {
+    push({
+      name: line.name,
+      detail: line.detail,
+      qty: line.qty,
+      unitPrice: line.purchasable ? line.unitPrice : null,
+      extension: line.purchasable ? cents(line.qty * line.unitPrice) : null,
+      fittingSku: null,
+      fittingTradeLabel: null,
+      kind: "hinge",
     });
   }
 
@@ -2559,9 +3531,12 @@ export function fortyFiveLayout(
 }
 
 function sketchNames(nodes: SketchNode[]): Map<string, string> {
-  const real = nodes.filter((node) => !node.host).sort((a, b) => a.z - b.z || a.x - b.x);
+  const real = nodes.filter((node) => !node.host && !node.tip).sort((a, b) => a.z - b.z || a.x - b.x);
   const names = new Map(real.map((node, i) => [node.id, colName(i)]));
-  for (const node of nodes) if (node.host) names.set(node.id, "joint");
+  for (const node of nodes) {
+    if (node.tip) names.set(node.id, "open end");
+    else if (node.host) names.set(node.id, "joint");
+  }
   return names;
 }
 
@@ -2957,7 +3932,7 @@ export function railRunError(project: Project, stops: { nodeId: string; y: numbe
       }
     }
     for (const node of full.nodes) {
-      if (node.host || node.id === seg.a.id || node.id === seg.b.id) continue;
+      if (node.host || node.tip || node.id === seg.a.id || node.id === seg.b.id) continue;
       const dx = seg.b.x - seg.a.x;
       const dz = seg.b.z - seg.a.z;
       const len2 = dx * dx + dz * dz;
@@ -2988,7 +3963,7 @@ export function railRunError(project: Project, stops: { nodeId: string; y: numbe
     const da = cardinalDir(b.x - a.x, b.z - a.z);
     const db = da ? cardinalDir(a.x - b.x, a.z - b.z) : null;
     if (!da || !db || Math.abs(y - yB) > 1 / 16) return null;
-    return occupy(a.id, y, da, complain) ?? occupy(b.id, yB, db, complain);
+    return (a.tip ? null : occupy(a.id, y, da, complain)) ?? (b.tip ? null : occupy(b.id, yB, db, complain));
   };
   for (const link of full.links) {
     if (link.kind !== "rail") continue;
@@ -3049,7 +4024,7 @@ export function railRunError(project: Project, stops: { nodeId: string; y: numbe
       [seg.a, seg.y],
       [seg.b, seg.yB],
     ] as const) {
-      if (end.host) continue;
+      if (end.host || end.tip) continue;
       if (y < 1.25) {
         return `A rail at ${formatDecimal(y)} on post ${label(end.id)} sits too close to the floor for the clamp to bite. Leave about 1" of pipe past the fitting.`;
       }
@@ -3209,6 +4184,41 @@ export function selfCheck(): void {
 
   const half = buildProject({ ...corner, trade: "half" });
   if (half.shimCount !== 4 * 3) throw new Error(`shims ${half.shimCount} expected 12`);
+  if (half.oneShimCount !== 0) throw new Error(`half frame should not use a 1" shim, got ${half.oneShimCount}`);
+
+  const pureOne = buildProject({ ...corner, trade: "one" });
+  if (pureOne.oneShimCount !== 0) throw new Error(`pure 1" frame added ${pureOne.oneShimCount} shims`);
+
+  const shimProject: Project = {
+    ...base,
+    mode: "sketch",
+    trade: "one",
+    nodes: [
+      { id: "a", x: 0, z: 0, height: 36, flange: false },
+      { id: "b", x: 48, z: 0, height: 36, flange: false },
+    ],
+    links: [{ id: "ab", a: "a", b: "b", y: 34, kind: "rail", trade: "three-quarter" }],
+    baysX: [],
+    baysZ: [],
+    levels: [],
+  };
+  const mixedShim = buildProject(shimProject);
+  if (mixedShim.oneShimCount !== 2) throw new Error(`1" clamp on 3/4" rail should take 2 shims, got ${mixedShim.oneShimCount}`);
+  const shimSheet = sheetIndex(shimProject, mixedShim);
+  const shimRow = shimSheet.items.find((item) => item.kind === "shim");
+  if (!shimRow || shimRow.qty !== 2 || !shimRow.name.includes("3/4")) throw new Error(`buy list missing 1" shim (${shimSheet.items.map((item) => item.name).join(", ")})`);
+  if (Math.abs((shimRow.extension ?? 0) - 2 * ONE_SHIM_PRICE) > 1e-6) throw new Error(`1" shim price ${shimRow.extension}`);
+
+  const halfInOne = buildProject({
+    ...shimProject,
+    nodes: [
+      { id: "a", x: 0, z: 0, height: 36, flange: false, trade: "half" },
+      { id: "b", x: 48, z: 0, height: 36, flange: false },
+    ],
+    links: [{ id: "ab", a: "a", b: "b", y: 34, kind: "rail" }],
+  });
+  if (halfInOne.oneShimCount !== 0) throw new Error(`1/2" in a 1" clamp is not a shim, got ${halfInOne.oneShimCount}`);
+  if (!halfInOne.issues.some((issue) => issue.text.includes("1/2"))) throw new Error("expected a warning that 1\" clamps do not shim onto 1/2\"");
 
   const bench = buildProject({
     ...base,
@@ -3729,4 +4739,206 @@ export function selfCheck(): void {
   const coupledRun = Math.abs(tAfter) * 48;
   if (Math.abs(coupledRun - coupledRise) > 0.4) throw new Error(`coupled 45 run ${coupledRun} rise ${coupledRise} t ${tAfter}`);
   if (!(tAfter > 0.5 + 0.02)) throw new Error(`rail joint should lengthen, t ${tAfter}`);
+
+  const stickOut: Project = {
+    ...base,
+    mode: "sketch",
+    nodes: [
+      { id: "a", x: 0, z: 0, height: 48, flange: false },
+      { id: "b", x: 48, z: 0, height: 48, flange: false },
+    ],
+    links: [{ id: "ab", a: "a", b: "b", y: 34, kind: "rail", pastB: 6 }],
+    baysX: [],
+    baysZ: [],
+    levels: [],
+  };
+  const plain = buildProject(stickOut);
+  const plainRail = plain.rails.find((rail) => rail.id === "rail:ab");
+  if (!plainRail || Math.abs(plainRail.metal - 45.5) > 1e-6) throw new Error(`continuous post should ignore the stick-out, metal ${plainRail?.metal}`);
+  if (plain.fittings.some((fitting) => fitting.sku === "cross" || fitting.sku === "180")) {
+    throw new Error("a continuous post must not pass the rail");
+  }
+  if ((plain.bom.find((item) => item.sku === "T")?.qty ?? 0) !== 2) throw new Error("continuous rail should be two Ts");
+
+  const passed = buildProject({
+    ...stickOut,
+    nodes: [
+      { id: "a", x: 0, z: 0, height: 48, flange: false },
+      { id: "b", x: 48, z: 0, height: 48, flange: false, split: 34 },
+    ],
+  });
+  const passedRail = passed.rails.find((rail) => rail.id === "rail:ab");
+  if (!passedRail || Math.abs(passedRail.metal - 52.75) > 1e-6) throw new Error(`split stick-out metal ${passedRail?.metal}`);
+  if (passed.posts.length !== 3) throw new Error(`split post should be two pieces, posts ${passed.posts.length}`);
+  const lower = passed.posts.find((post) => post.id === "post:b");
+  const upper = passed.posts.find((post) => post.id === "post:b:hi");
+  if (!lower || !upper) throw new Error("missing split post pieces");
+  if (Math.abs(lower.setbackB - 1.28125) > 1e-6 || Math.abs(upper.setbackA - 1.28125) > 1e-6) {
+    throw new Error(`split setbacks ${lower?.setbackB} ${upper?.setbackA}`);
+  }
+  const passFit = passed.fittings.find((fitting) => fitting.sku === "180" && fitting.id.startsWith("fit:b"));
+  if (!passFit || Math.abs(passFit.axis?.[0] ?? 0) < 0.9) throw new Error("split fitting should be a 180 along the rail");
+  if (!passFit.branches.some((branch) => branch.dir[1] > 0.9) || !passFit.branches.some((branch) => branch.dir[1] < -0.9)) {
+    throw new Error("split 180 saddles should point up and down");
+  }
+  if (passed.fittings.some((fitting) => fitting.sku === "cross")) throw new Error("a split post is not a cross");
+  if ((passed.bom.find((item) => item.sku === "T")?.qty ?? 0) !== 1) throw new Error("the other end stays a T");
+
+  const sliced = buildProject({
+    ...stickOut,
+    links: [{ id: "ab", a: "a", b: "b", y: 34, kind: "rail", cutB: "horizontal", pastB: 6 }],
+  });
+  if (sliced.posts.length !== 2) throw new Error(`a cut rail should leave the post whole, posts ${sliced.posts.length}`);
+  const slicedMain = sliced.rails.find((rail) => rail.id === "rail:ab");
+  const slicedStub = sliced.rails.find((rail) => rail.id === "rail:ab:stubB");
+  if (!slicedMain || Math.abs(slicedMain.metal - 45.46875) > 1e-6) throw new Error(`cut rail metal ${slicedMain?.metal}`);
+  if (!slicedStub || Math.abs(slicedStub.metal - 4.71875) > 1e-6) throw new Error(`stub metal ${slicedStub?.metal}`);
+  const footage = [...slicedMain.pieces, ...slicedStub.pieces].reduce((sum, n) => sum + n, 0);
+  if (Math.abs(footage - (45.46875 + 4.71875)) > 1e-6) throw new Error(`pdf footage ${footage}`);
+  if ((sliced.bom.find((item) => item.sku === "T")?.qty ?? 0) !== 1) throw new Error("cut rail should keep one T");
+  const slicedFit = sliced.fittings.find((fitting) => fitting.sku === "180");
+  if (!slicedFit) throw new Error("cut rail should be a 180");
+  if ((slicedFit.axis?.[0] ?? 0) > 0.5) throw new Error("the post is the through, not the rail");
+  if (slicedFit.axis && Math.abs(slicedFit.axis[1] - 1) > 0.05) throw new Error("180 collar should stay vertical");
+  if (!slicedFit.branches.some((branch) => branch.dir[0] > 0.9) || !slicedFit.branches.some((branch) => branch.dir[0] < -0.9)) {
+    throw new Error("180 saddles should face both ways along the rail");
+  }
+  if (sliced.fittings.some((fitting) => fitting.sku === "cross")) throw new Error("a cut rail is not a cross");
+  if (!sliced.cuts.some((row) => row.kind === "rail" && Math.abs(row.length - 45.46875) < 1e-6)) throw new Error("pdf missing the main rail");
+  if (!sliced.cuts.some((row) => row.kind === "rail" && Math.abs(row.length - 4.71875) < 1e-6)) throw new Error("pdf missing the stub");
+
+  const branched = buildProject({
+    ...stickOut,
+    nodes: [
+      { id: "a", x: 0, z: 0, height: 48, flange: false },
+      { id: "b", x: 48, z: 0, height: 48, flange: false },
+      { id: "c", x: 48, z: 36, height: 48, flange: false },
+    ],
+    links: [
+      { id: "ab", a: "a", b: "b", y: 34, kind: "rail", cutB: "horizontal", pastB: 6 },
+      { id: "bc", a: "b", b: "c", y: 34, kind: "rail" },
+    ],
+  });
+  const way = branched.fittings.find((fitting) => fitting.id.startsWith("fit:b"));
+  if (!way || way.sku !== "4way") throw new Error(`a third pipe should be a 4-way, got ${way?.sku}`);
+  if (way.axis && Math.abs(way.axis[0]) > 0.5) throw new Error("4-way through should stay the post");
+  if (branched.fittings.some((fitting) => fitting.sku === "cross" || fitting.sku === "180")) {
+    throw new Error("do not fake a 4-way with a cross or a 180");
+  }
+  const branchMain = branched.rails.find((rail) => rail.id === "rail:ab");
+  const branchStub = branched.rails.find((rail) => rail.id === "rail:ab:stubB");
+  if (!branchMain || Math.abs(branchMain.metal - 45.46875) > 1e-6) throw new Error(`4-way rail metal ${branchMain?.metal}`);
+  if (!branchStub || Math.abs(branchStub.metal - 4.71875) > 1e-6) throw new Error(`4-way stub metal ${branchStub?.metal}`);
+
+  const hungProject: Project = {
+    ...base,
+    mode: "sketch",
+    nodes: [
+      { id: "a", x: 0, z: 0, height: 36, flange: false, cap: true },
+      { id: "tip", x: 48, z: 0, height: 34, flange: false, tip: true },
+    ],
+    links: [{ id: "ab", a: "a", b: "tip", y: 34, kind: "rail", capB: true }],
+    baysX: [],
+    baysZ: [],
+    levels: [],
+  };
+  const hung = buildProject(hungProject);
+  const hungRail = hung.rails.find((rail) => rail.id === "rail:ab");
+  if (hung.posts.length !== 1) throw new Error(`a single post should stay one post, got ${hung.posts.length}`);
+  if ((hung.bom.find((item) => item.sku === "T")?.qty ?? 0) !== 1) throw new Error("one post takes one T");
+  if (hung.fittings.some((fitting) => fitting.sku === "180" || fitting.sku === "cross")) throw new Error("an open end is not a clamp");
+  if (!hungRail || Math.abs(hungRail.metal - 46.75) > 1e-6 || hungRail.setbackB !== 0) throw new Error(`open rail metal ${hungRail?.metal}`);
+  if (hung.caps.reduce((sum, line) => sum + line.qty, 0) !== 2) throw new Error(`expected two caps, got ${hung.caps.map((line) => line.qty).join(",")}`);
+  if (Math.abs(hung.capCost - 0.99) > 1e-6) throw new Error(`cap cost ${hung.capCost}`);
+  const hungSheet = sheetIndex(hungProject, hung);
+  const capRow = hungSheet.items.find((item) => item.kind === "cap");
+  if (!capRow || capRow.qty !== 2) throw new Error("buy list missing end caps");
+  if (Math.abs(hungSheet.partsTotal - hung.connectorCost) > 0.02) throw new Error(`capped parts ${hungSheet.partsTotal} vs ${hung.connectorCost}`);
+  if (railRunError({ ...hungProject, links: [] }, [
+    { nodeId: "a", y: 34 },
+    { nodeId: "tip", y: 34 },
+  ])) {
+    throw new Error("a rail on one post should be legal");
+  }
+  const squared = squareFrom({ x: 0, z: 0 }, 10, 3);
+  if (squared.x !== 10 || squared.z !== 0) throw new Error(`open end should land square, got ${squared.x},${squared.z}`);
+  const door = buildProject({
+    ...hungProject,
+    hinges: [
+      { id: "h1", memberId: "post:a", kind: "leaf", at: 10, side: 1 },
+      { id: "h2", memberId: "post:a", kind: "leaf", at: 28, side: 1 },
+    ],
+  });
+  if (door.hardware.length !== 1 || door.hardware[0]?.qty !== 1) throw new Error(`hinge set qty ${door.hardware[0]?.qty}`);
+  if (Math.abs(door.connectorCost - hung.connectorCost - LEAF_SET_PRICE) > 0.02) {
+    throw new Error(`hinge set cost ${door.connectorCost - hung.connectorCost}`);
+  }
+  if (Math.abs(sheetIndex({ ...hungProject, hinges: door.hinges }, door).partsTotal - door.connectorCost) > 0.02) {
+    throw new Error("hinge sheet drifted from the buy list");
+  }
+  const barreled = buildProject({
+    ...hungProject,
+    trade: "one",
+    hinges: [{ id: "b1", memberId: "post:a", kind: "barrel", at: 18, side: 1 }],
+  });
+  if (barreled.oneShimCount < 2) throw new Error(`barrel on 1" needs two shims, got ${barreled.oneShimCount}`);
+  if (!barreled.issues.some((issue) => issue.text.includes("1\" to 3/4\" shim"))) throw new Error("barrel shim note missing");
+  const plainBarrel = buildProject({
+    ...hungProject,
+    hinges: [{ id: "b1", memberId: "post:a", kind: "barrel", at: 18, side: 1 }],
+  });
+  if (plainBarrel.shimCount !== hung.shimCount || plainBarrel.oneShimCount !== hung.oneShimCount) {
+    throw new Error("a 3/4\" barrel does not take a shim");
+  }
+  const host = hung.posts.find((post) => post.id === "post:a");
+  const frame = host
+    ? doorFrame(host, [
+        { id: "h1", memberId: "post:a", kind: "leaf", at: 10, side: 1 },
+        { id: "h2", memberId: "post:a", kind: "leaf", at: 28, side: 1 },
+      ], 32)
+    : null;
+  if (!frame || Math.abs(frame.width - 32) > 0.05 || frame.dirZ !== 1) throw new Error(`door frame ${frame?.width} ${frame?.dirZ}`);
+  const gateProject: Project = {
+    ...hungProject,
+    nodes: [
+      ...(hungProject.nodes ?? []),
+      { id: "dh", x: frame.hinge.x, z: frame.hinge.z, height: frame.hinge.height, base: frame.hinge.base, flange: false, door: "d1" },
+      { id: "dl", x: frame.latch.x, z: frame.latch.z, height: frame.latch.height, base: frame.latch.base, flange: false, door: "d1" },
+    ],
+    links: [
+      ...(hungProject.links ?? []),
+      { id: "db", a: "dh", b: "dl", y: frame.bottom, kind: "rail" },
+      { id: "dt", a: "dh", b: "dl", y: frame.top, kind: "rail" },
+    ],
+    doors: [
+      {
+        id: "d1",
+        memberId: "post:a",
+        width: frame.width,
+        hingeNode: "dh",
+        latchNode: "dl",
+        bottomRail: "db",
+        topRail: "dt",
+        dirX: frame.dirX,
+        dirZ: frame.dirZ,
+      },
+    ],
+    hingeSwing: [{ memberId: "post:a", deg: 40 }],
+    hinges: [
+      { id: "h1", memberId: "post:a", kind: "leaf", at: 10, side: 1 },
+      { id: "h2", memberId: "post:a", kind: "leaf", at: 28, side: 1 },
+    ],
+  };
+  const gate = buildProject(gateProject);
+  if (gate.posts.length !== hung.posts.length + 2) throw new Error(`door posts ${gate.posts.length}`);
+  if (gate.rails.length !== hung.rails.length + 2) throw new Error(`door rails ${gate.rails.length}`);
+  const closedLatch = gate.members.find((member) => member.id === "post:dl");
+  const posed = poseSwung(normalizeProject(gateProject), gate);
+  const openLatch = posed.members.find((member) => member.id === "post:dl");
+  const closedHinge = gate.members.find((member) => member.id === "post:dh");
+  const openHinge = posed.members.find((member) => member.id === "post:dh");
+  if (!closedLatch || !openLatch || !closedHinge || !openHinge) throw new Error("door members missing");
+  if (Math.abs(openLatch.metal - closedLatch.metal) > 0.01) throw new Error("swing changed a cut");
+  if (Math.hypot(openLatch.a[0] - closedLatch.a[0], openLatch.a[2] - closedLatch.a[2]) < 1) throw new Error("latch stile should swing");
+  if (Math.hypot(openHinge.a[0] - closedHinge.a[0], openHinge.a[2] - closedHinge.a[2]) > 0.2) throw new Error("hinge stile should stay on the knuckle");
 }

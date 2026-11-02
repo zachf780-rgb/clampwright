@@ -588,7 +588,7 @@ export function DesignPacket({
           {index.items.map((item) => (
             <li key={item.no}>
               <span className="callout">{item.no}</span>
-              {item.kind === "strap" ? <StrapIcon /> : item.kind === "emt" || item.kind === "shim" ? <TubeIcon /> : <PartIcon kind={item.fittingSku ?? "T"} />}
+              {item.kind === "strap" ? <StrapIcon /> : item.kind === "hinge" ? <PartIcon kind="hinge" /> : item.kind === "emt" || item.kind === "shim" || item.kind === "cap" ? <TubeIcon /> : <PartIcon kind={item.fittingSku ?? "T"} />}
               <span>
                 <strong>{item.name}</strong>
                 <em>
