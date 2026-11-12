@@ -1567,6 +1567,15 @@ function HingeCard({ unit, member }: { unit: "in" | "ft"; member: Member }) {
   const swing = project.hingeSwing.find((item) => item.memberId === member.id)?.deg ?? 0;
   const max = hingeOpenMax(kind);
   const pipe = member.trade ?? project.trade;
+  const rise = member.b[1] - member.a[1];
+  const sloped = Math.abs(rise) > 1;
+  const yOf = (at: number) => member.a[1] + (rise * at) / Math.max(member.span, 1e-6);
+  const atForY = (y: number) => ((y - member.a[1]) / (rise === 0 ? 1 : rise)) * member.span;
+  const floorLo = Math.min(yOf(lo), yOf(hi));
+  const floorHi = Math.max(yOf(lo), yOf(hi));
+  const topY = Math.max(member.a[1], member.b[1]);
+  const fromTopMin = Math.max(0, topY - floorHi);
+  const fromTopMax = Math.max(fromTopMin, topY - floorLo);
   const pickKind = (next: HingeKind) => {
     setDraftKind(next);
     if (mine.length) {
@@ -1627,7 +1636,9 @@ function HingeCard({ unit, member }: { unit: "in" | "ft"; member: Member }) {
                 ? "This opens the door. The frame is real pipe, and lumber strapped to it swings with it."
                 : kind === "angle"
                   ? "This hinge folds a pipe up to 90°. It is not a gate. The preview arm is not extra conduit."
-                  : "The pale gate is a preview so you can see the swing. It is not extra pipe and it is not on the cut list. It hides when you leave Hinge, unless Hinge ghosts is on under View."}
+                  : member.kind === "rail"
+                    ? "Shut hangs the gate straight down. Open swings it like a door on a post. The pale gate is a preview, not extra pipe, and it is not on the cut list."
+                    : "The pale gate is a preview so you can see the swing. It is not extra pipe and it is not on the cut list. It hides when you leave Hinge, unless Hinge ghosts is on under View."}
             </p>
           </div>
         )
@@ -1668,7 +1679,11 @@ function HingeCard({ unit, member }: { unit: "in" | "ft"; member: Member }) {
               <Plus size={16} />
             </button>
           </div>
-          <p className="fine">Same idea as straps. Choose how many, then set each one from {fromStart} or from {fromEnd}. A door usually wants two.</p>
+          <p className="fine">
+            {sloped
+              ? "Same idea as straps. Set each hinge by its height from the floor, so a rail can line up with a post. A door usually wants two."
+              : `Same idea as straps. Choose how many, then set each one from ${fromStart} or from ${fromEnd}. A door usually wants two.`}
+          </p>
           {kind === "barrel" ? (
             <p className="fine">A barrel spins on the pipe, so the face does not move the knuckle. Use Swing to open the gate.</p>
           ) : (
@@ -1688,36 +1703,75 @@ function HingeCard({ unit, member }: { unit: "in" | "ft"; member: Member }) {
                 : "The angle hinge folds up to 90° either way. The other face is the other way."}
             </p>
           ) : null}
-          {mine.map((hinge, index) => (
+          {mine.map((hinge, index) => {
+            const height = yOf(hinge.at);
+            return (
             <div key={hinge.id} className="hinge-seat">
               <div className="bay-row">
-                <LenField
-                  label={`${index + 1} from ${fromStart}`}
-                  inches={hinge.at}
-                  unit={unit}
-                  min={lo}
-                  max={Math.max(lo, hi)}
-                  onCommit={(at) => moveHinge(hinge.id, at, lo, hi)}
-                />
-                <LenField
-                  label={`From ${fromEnd}`}
-                  inches={Math.max(0, span - hinge.at)}
-                  unit={unit}
-                  min={0}
-                  max={span}
-                  onCommit={(fromFar) => moveHinge(hinge.id, span - fromFar, lo, hi)}
-                />
+                {sloped ? (
+                  <>
+                    <LenField
+                      label={`${index + 1} height from the floor`}
+                      inches={height}
+                      unit={unit}
+                      min={floorLo}
+                      max={Math.max(floorLo, floorHi)}
+                      onCommit={(y) => moveHinge(hinge.id, atForY(y), lo, hi)}
+                    />
+                    <LenField
+                      label="From the top"
+                      inches={Math.max(0, topY - height)}
+                      unit={unit}
+                      min={fromTopMin}
+                      max={fromTopMax}
+                      onCommit={(fromTop) => moveHinge(hinge.id, atForY(topY - fromTop), lo, hi)}
+                    />
+                  </>
+                ) : (
+                  <>
+                    <LenField
+                      label={`${index + 1} from ${fromStart}`}
+                      inches={hinge.at}
+                      unit={unit}
+                      min={lo}
+                      max={Math.max(lo, hi)}
+                      onCommit={(at) => moveHinge(hinge.id, at, lo, hi)}
+                    />
+                    <LenField
+                      label={`From ${fromEnd}`}
+                      inches={Math.max(0, span - hinge.at)}
+                      unit={unit}
+                      min={0}
+                      max={span}
+                      onCommit={(fromFar) => moveHinge(hinge.id, span - fromFar, lo, hi)}
+                    />
+                  </>
+                )}
               </div>
               <div className="lean-end" role="group" aria-label={`Slide hinge ${index + 1}`}>
-                <button type="button" className="btn" aria-label="Move hinge toward the start" onClick={() => moveHinge(hinge.id, hinge.at - 1, lo, hi)}>
-                  {member.kind === "post" ? "↓" : "←"}
-                </button>
-                <button type="button" className="btn" aria-label="Move hinge toward the end" onClick={() => moveHinge(hinge.id, hinge.at + 1, lo, hi)}>
-                  {member.kind === "post" ? "↑" : "→"}
-                </button>
+                {sloped ? (
+                  <>
+                    <button type="button" className="btn" aria-label="Move hinge down" onClick={() => moveHinge(hinge.id, atForY(height - 1), lo, hi)}>
+                      ↓
+                    </button>
+                    <button type="button" className="btn" aria-label="Move hinge up" onClick={() => moveHinge(hinge.id, atForY(height + 1), lo, hi)}>
+                      ↑
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button type="button" className="btn" aria-label="Move hinge toward the start" onClick={() => moveHinge(hinge.id, hinge.at - 1, lo, hi)}>
+                      ←
+                    </button>
+                    <button type="button" className="btn" aria-label="Move hinge toward the end" onClick={() => moveHinge(hinge.id, hinge.at + 1, lo, hi)}>
+                      →
+                    </button>
+                  </>
+                )}
               </div>
             </div>
-          ))}
+            );
+          })}
         </>
       )}
     </div>
@@ -1737,7 +1791,7 @@ function hingeBlurb(kind: HingeKind, pipe: "half" | "three-quarter" | "one"): st
         ? `Barrel hinge, ${money(BARREL_PRICE)}. Clamp a 3/4" connector on each half. The 1/2" pipe in that connector needs a shim. The barrel itself is too big to shim down to 1/2".`
         : `Barrel hinge, ${money(BARREL_PRICE)}. It is 4" long and ${BARREL_OD}" across — 0.018" over 3/4" EMT. The 3/4" clamp still closes on it, so this size does not take a shim.`;
   }
-  return `Adjustable angle hinge, ${money(ANGLE_HINGE_PRICE[pipe])} complete. Leave the top bolt loose and the pipe folds up to 90° either way.${pipe === "half" ? " The 1/2\" price includes the shims." : ""}`;
+  return `Adjustable angle hinge, ${money(ANGLE_HINGE_PRICE[pipe])} complete. The short puzzle piece grips the post and the longer end clamp stops the pipe. Leave the top bolt loose and it folds up to 90° either way.${pipe === "half" ? " The 1/2\" price includes the shims." : ""}`;
 }
 
 function uprightPost(member: Member): boolean {
@@ -1810,7 +1864,7 @@ function DoorTune({ door, unit }: { door: Door; unit: "in" | "ft" }) {
         </button>
       </div>
       {doorNote ? <p className="fine">{doorNote}</p> : null}
-      <p className="fine">This frame is real pipe on the cut list. It is not clamped to the post. Straps on it take lumber, and this swing takes that lumber with the door.</p>
+      <p className="fine">This frame is real pipe on the cut list. The hinges hold it — it is not clamped to that pipe. Straps on it take lumber, and this swing takes that lumber with the door.</p>
       <DeleteButton name="door" onDelete={() => removeDoor(door.id)} />
     </div>
   );
@@ -1825,9 +1879,16 @@ function DoorCard({ unit, member }: { unit: "in" | "ft"; member: Member | null }
   const project = normalizeProject(projects.find((item) => item.id === activeId) ?? projects[0]);
   const door = doorOf(project, member);
   const [width, setWidth] = useState(32);
+  const memberId = member?.id ?? "";
+  const memberKind = member?.kind;
+  const planIn = member ? Math.hypot(member.b[0] - member.a[0], member.b[2] - member.a[2]) : 0;
+  useEffect(() => {
+    if (memberKind === "rail") setWidth(Math.round(Math.min(96, Math.max(8, planIn || 32)) * 32) / 32);
+    else if (memberKind === "post") setWidth(32);
+  }, [memberId, memberKind, planIn]);
   const mine = member ? project.hinges.filter((hinge) => hinge.memberId === member.id) : [];
   const angled = mine.length > 0 && mine.every((hinge) => hinge.kind === "angle");
-  const usable = member != null && uprightPost(member) && mine.some((hinge) => hinge.kind !== "angle");
+  const usable = member != null && (member.kind === "rail" || uprightPost(member)) && mine.some((hinge) => hinge.kind !== "angle");
   return (
     <div className="float-card" data-testid="door-card">
       <div className="card-head">
@@ -1841,13 +1902,17 @@ function DoorCard({ unit, member }: { unit: "in" | "ft"; member: Member | null }
       ) : !member ? (
         <p className="fine">Click a glowing hinge. Those are the only places a door can hang. Then set the width and place it.</p>
       ) : angled ? (
-        <p className="fine">An angle hinge folds a pipe. A door needs offset or barrel hinges on an upright post.</p>
+        <p className="fine">An angle hinge folds a pipe. A door needs offset or barrel hinges.</p>
       ) : !usable ? (
-        <p className="fine">A door hangs on offset or barrel hinges on an upright post. A rail can take a hinge, but not a door.</p>
+        <p className="fine">A door hangs straight down from offset or barrel hinges. On a post, use an upright one.</p>
       ) : (
         <>
           <LenField label="Door width" testId="door-width" inches={width} unit={unit} min={8} max={96} onCommit={setWidth} />
-          <p className="fine">Width is the closed opening, from the hinge stile to the latch stile. 32 inches is a common gate.</p>
+          <p className="fine">
+            {member.kind === "rail"
+              ? "This door hangs straight down across this end. The stiles stay vertical, like a door on a post. Width is the closed opening."
+              : "Width is the closed opening, from the hinge stile to the latch stile. 32 inches is a common gate."}
+          </p>
           <button type="button" className="btn" data-testid="door-place" onClick={() => placeDoor(member.id, width)}>
             Place door
           </button>

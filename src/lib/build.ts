@@ -8,12 +8,15 @@ import {
   ANGLE_HINGE_PRICE,
   BARREL_LENGTH,
   BARREL_PRICE,
+  CLAMP_CENTERS,
+  HINGE_BODY,
   LEAF_SET_COUNT,
   LEAF_SET_PRICE,
   CAP_PACK,
   capEach,
   capPackPrice,
   connectorPrice,
+  hingeSetback,
   skuShort,
   type FamilySpec,
   type Finish,
@@ -614,6 +617,67 @@ function throughAxis(node: SketchNode, byId: Map<string, SketchNode>, links: Ske
     }
   }
   return [0, 1, 0];
+}
+
+const CLAMP_SKU = new Set<Sku>(["T", "90", "180", "4way", "5way", "cross", "hinge", "45"]);
+
+function clampStations(fittings: Fitting[], origin: Vec3, axis: Vec3): number[] {
+  const out: number[] = [];
+  for (const fitting of fittings) {
+    if (!CLAMP_SKU.has(fitting.sku)) continue;
+    const dx = fitting.position[0] - origin[0];
+    const dy = fitting.position[1] - origin[1];
+    const dz = fitting.position[2] - origin[2];
+    const along = dx * axis[0] + dy * axis[1] + dz * axis[2];
+    const off = Math.hypot(dx - axis[0] * along, dy - axis[1] * along, dz - axis[2] * along);
+    if (off > 0.55) continue;
+    out.push(along);
+  }
+  return out;
+}
+
+function throughLimits(node: SketchNode, origin: Vec3, axis: Vec3, byId: Map<string, SketchNode>, links: SketchLink[]): [number, number] {
+  const pad = HINGE_BODY / 2;
+  if (!node.host) {
+    if (axis[1] > 0.9) return [postFoot(node) + pad - origin[1], node.height - pad - origin[1]];
+    return [-pad, pad];
+  }
+  const link = links.find((item) => item.id === node.host);
+  const a = link ? byId.get(link.a) : undefined;
+  const b = link ? byId.get(link.b) : undefined;
+  if (!link || !a || !b) return [-6, 6];
+  const [ya, yb] = endHeights(link);
+  const ends: Vec3[] = [
+    [a.x, a.host ? a.height : ya, a.z],
+    [b.x, b.host ? b.height : yb, b.z],
+  ];
+  const scalars = ends.map((point) => (point[0] - origin[0]) * axis[0] + (point[1] - origin[1]) * axis[1] + (point[2] - origin[2]) * axis[2]);
+  return [Math.min(...scalars) + pad, Math.max(...scalars) - pad];
+}
+
+/** Slide a hinge or 45 off any clamp already on this pipe. Returns inches along `axis`. */
+function clearAngleSeat(prefer: number, taken: number[], lo: number, hi: number): number | null {
+  const blocked = (t: number) => taken.some((other) => Math.abs(other - t) < CLAMP_CENTERS - 1e-3);
+  if (lo <= 1e-3 && hi >= -1e-3 && !blocked(0)) return 0;
+  const walk = (sign: number): number | null => {
+    for (let i = 1; i < 4096; i += 1) {
+      const t = Math.round(((sign * i) / 32) * 32) / 32;
+      if (t < lo - 1e-3 || t > hi + 1e-3) return null;
+      if (!blocked(t)) return t;
+    }
+    return null;
+  };
+  if (!(hi > lo + 0.2)) return null;
+  const sign = prefer < 0 ? -1 : 1;
+  return walk(sign) ?? walk(-sign);
+}
+
+function throughTrade(node: SketchNode, project: FullProject): TradeId {
+  if (node.host) {
+    const link = project.links.find((item) => item.id === node.host);
+    return link?.trade ?? project.trade;
+  }
+  return node.trade ?? project.trade;
 }
 function at(origin: Vec3, dir: Vec3, d: number): Vec3 {
   return add(origin, scale(dir, d));
@@ -1382,7 +1446,7 @@ function buildSketch(project: FullProject): Build {
   if (nodes.some((node) => node.door)) {
     issues.push({
       severity: "info",
-      text: "A door is real pipe on the cut list. The hinges hold it — it is not clamped to that post. Straps on the door take lumber, and swinging the hinge swings the door and that lumber.",
+      text: "A door is real pipe on the cut list. The hinges hold it — it is not clamped to that pipe. Straps on the door take lumber, and swinging the hinge swings the door and that lumber.",
     });
   }
 
@@ -1734,6 +1798,34 @@ function buildSketch(project: FullProject): Build {
 
   const rails: Member[] = [];
   let diagonalNoted = false;
+  const angleSeat = (node: SketchNode, point: Vec3, other: Vec3): { at: Vec3; delta: number; stuck: boolean } => {
+    if (node.tip) return { at: point, delta: 0, stuck: false };
+    const axis = throughAxis(node, byId, project.links);
+    const toward = (other[0] - point[0]) * axis[0] + (other[1] - point[1]) * axis[1] + (other[2] - point[2]) * axis[2];
+    const prefer = toward < -0.05 ? -1 : toward > 0.05 ? 1 : -1;
+    const [lo, hi] = throughLimits(node, point, axis, byId, project.links);
+    const delta = clearAngleSeat(prefer, clampStations(fittings, point, axis), lo, hi);
+    if (delta == null) return { at: point, delta: 0, stuck: true };
+    if (Math.abs(delta) < 1 / 64) return { at: point, delta: 0, stuck: false };
+    return { at: at(point, axis, delta), delta, stuck: false };
+  };
+  const noteSeat = (node: SketchNode, delta: number, stuck: boolean, railName: string, part: string) => {
+    const where = node.host ? "that rail" : `post ${nameOf.get(node.id) ?? "?"}`;
+    if (stuck) {
+      issues.push({
+        severity: "warn",
+        text: `The ${part} on ${railName} lands on another clamp on ${where}, and there isn't 2 1/4" of free pipe. Move one of them.`,
+      });
+      return;
+    }
+    if (Math.abs(delta) < 1 / 64) return;
+    const axis = throughAxis(node, byId, project.links);
+    const way = Math.abs(axis[1]) > 0.9 ? (delta > 0 ? "above" : "below") : "away from";
+    issues.push({
+      severity: "info",
+      text: `The ${part} on ${railName} sits ${formatDecimal(Math.abs(delta))} ${way} the other clamp on ${where}. Those are different parts, so they can't share one spot.`,
+    });
+  };
 
   for (const link of project.links) {
     if (link.kind !== "rail") continue;
@@ -1746,7 +1838,6 @@ function buildSketch(project: FullProject): Build {
     if ((!a.host && !a.tip && ya > a.height + 0.05) || (!b.host && !b.tip && yb > b.height + 0.05)) continue;
     const run = Math.hypot(b.x - a.x, b.z - a.z);
     if (Math.hypot(run, ya - yb) < 0.5) continue;
-    const sloped = Math.abs(ya - yb) > 1 / 16;
     const keyA = `${link.id}:a`;
     const keyB = `${link.id}:b`;
     const linkFam = FAMILIES[tradeById(link.trade ?? project.trade).family];
@@ -1760,64 +1851,94 @@ function buildSketch(project: FullProject): Build {
     const pastB = passB && link.cutB !== "horizontal" ? cleanPast(link.pastB) : 0;
     const openSpec = { setback: 0, outer: 0, inner: 0, approx: false, seat: "open" };
     const throughSpec = { setback: 0, outer: 0, inner: 0, approx: false, seat: "180°" };
-    const hingeFor = { setback: linkFam.braceSetback, outer: linkFam.T.outer, inner: linkFam.T.inner, approx: true, seat: "hinge" };
-    const specA = tipA ? openSpec : passA ? throughSpec : (setbacks.get(keyA) ?? (diagonal.has(link.id) || hingeEnd.has(keyA) ? hingeFor : null));
-    const specB = tipB ? openSpec : passB ? throughSpec : (setbacks.get(keyB) ?? (diagonal.has(link.id) || hingeEnd.has(keyB) ? hingeFor : null));
+    const freshHinge = (node: SketchNode) => ({
+      setback: hingeSetback(throughTrade(node, project)),
+      outer: linkFam.T.outer,
+      inner: linkFam.T.inner,
+      approx: true,
+      seat: "hinge",
+    });
+    const specA = tipA ? openSpec : passA ? throughSpec : (setbacks.get(keyA) ?? (diagonal.has(link.id) || hingeEnd.has(keyA) ? freshHinge(a) : null));
+    const specB = tipB ? openSpec : passB ? throughSpec : (setbacks.get(keyB) ?? (diagonal.has(link.id) || hingeEnd.has(keyB) ? freshHinge(b) : null));
     if (!specA || !specB) continue;
-    const approx = specA.approx || specB.approx || diagonal.has(link.id);
+    let endA: Vec3 = [a.x, ya, a.z];
+    let endB: Vec3 = [b.x, yb, b.z];
+    const railName = `rail ${nameOf.get(a.id)}–${nameOf.get(b.id)}`;
     if (diagonal.has(link.id)) {
-      const dir = norm([b.x - a.x, yb - ya, b.z - a.z]);
-      const angA = meetAngle(throughAxis(a, byId, project.links), sub([b.x, yb, b.z], [a.x, ya, a.z]));
-      const angB = meetAngle(throughAxis(b, byId, project.links), sub([a.x, ya, a.z], [b.x, yb, b.z]));
-      const skuA = Math.abs(angA - 45) <= 3 ? "45" : "hinge";
-      const skuB = Math.abs(angB - 45) <= 3 ? "45" : "hinge";
-      specA.seat = a.tip ? "open" : skuA === "45" ? "45°" : "hinge";
-      specB.seat = b.tip ? "open" : skuB === "45" ? "45°" : "hinge";
-      const pushAngle = (end: "a" | "b", sku: "45" | "hinge", node: SketchNode, at: Vec3, aim: Vec3, axis: Vec3) => {
+      const seatA = angleSeat(a, endA, endB);
+      const seatB = angleSeat(b, endB, seatA.at);
+      endA = seatA.at;
+      endB = seatB.at;
+      const aimA = sub(endB, endA);
+      const aimB = scale(aimA, -1);
+      const angA = meetAngle(throughAxis(a, byId, project.links), aimA);
+      const angB = meetAngle(throughAxis(b, byId, project.links), aimB);
+      const skuA = a.tip ? "hinge" : Math.abs(angA - 45) <= 3 ? "45" : "hinge";
+      const skuB = b.tip ? "hinge" : Math.abs(angB - 45) <= 3 ? "45" : "hinge";
+      if (!a.tip) {
+        specA.seat = skuA === "45" ? "45°" : "hinge";
+        specA.setback = skuA === "45" ? linkFam.braceSetback : hingeSetback(throughTrade(a, project));
+        specA.approx = true;
+        noteSeat(a, seatA.delta, seatA.stuck, railName, skuA === "45" ? "45° connector" : "adjustable hinge");
+      }
+      if (!b.tip) {
+        specB.seat = skuB === "45" ? "45°" : "hinge";
+        specB.setback = skuB === "45" ? linkFam.braceSetback : hingeSetback(throughTrade(b, project));
+        specB.approx = true;
+        noteSeat(b, seatB.delta, seatB.stuck, railName, skuB === "45" ? "45° connector" : "adjustable hinge");
+      }
+      const pushAngle = (end: "a" | "b", sku: "45" | "hinge", node: SketchNode, atPoint: Vec3, aim: Vec3, axis: Vec3, setback: number) => {
         if (node.tip) return;
-        const through = node.host ? (project.links.find((item) => item.id === node.host)?.trade ?? project.trade) : (node.trade ?? project.trade);
+        const through = throughTrade(node, project);
         const pipes = [through, link.trade ?? project.trade];
         const joint = largerTrade(pipes);
         noteOneOnHalf(issues, joint, pipes);
         fittings.push({
           id: `hinge:${link.id}:${end}`,
           sku,
-          position: at,
+          position: atPoint,
           axis,
-          branches: [{ dir: aim, setback: linkFam.braceSetback, outer: linkFam.T.outer, inner: linkFam.T.inner }],
+          branches: [{ dir: aim, setback, outer: linkFam.T.outer, inner: linkFam.T.inner }],
           purchasable: CONNECTOR_MAP[sku].trades.includes(joint),
-          approx: sku !== "45",
+          approx: true,
           trade: joint,
           ...grabShims(joint, pipes),
         });
       };
-      pushAngle("a", skuA, a, [a.x, ya, a.z], dir, throughAxis(a, byId, project.links));
-      pushAngle("b", skuB, b, [b.x, yb, b.z], scale(dir, -1), throughAxis(b, byId, project.links));
+      pushAngle("a", skuA, a, endA, norm(aimA), throughAxis(a, byId, project.links), specA.setback);
+      pushAngle("b", skuB, b, endB, norm(aimB), throughAxis(b, byId, project.links), specB.setback);
       if (!diagonalNoted) {
         diagonalNoted = true;
         issues.push({
           severity: "info",
-          text: "A pipe at 45° to a post or a rail uses the fixed 45° connector. Any other angle uses the adjustable hinge. Those hinge cuts are estimates — rough-cut, then slide the clamp.",
+          text: `A pipe at 45° uses the fixed 45° connector. Any other angle uses the adjustable hinge: a ${formatDecimal(HINGE_BODY)} puzzle piece on the post and a longer end clamp on the pipe. The pipe ends ${formatDecimal(hingeSetback("three-quarter"))} from the post center on 3/4" and 1/2", and ${formatDecimal(hingeSetback("one"))} on 1".`,
         });
       }
     } else if (hingeEnd.has(keyA) || hingeEnd.has(keyB)) {
       for (const end of ["a", "b"] as const) {
         if (!hingeEnd.has(`${link.id}:${end}`)) continue;
         const node = end === "a" ? a : b;
-        const other = end === "a" ? b : a;
-        const oy = end === "a" ? yb : ya;
-        const ny = end === "a" ? ya : yb;
-        const dir = norm([other.x - node.x, oy - ny, other.z - node.z]);
-        const through = node.host ? (project.links.find((item) => item.id === node.host)?.trade ?? project.trade) : (node.trade ?? project.trade);
+        const spec = end === "a" ? specA : specB;
+        const seat = angleSeat(node, end === "a" ? endA : endB, end === "a" ? endB : endA);
+        if (end === "a") endA = seat.at;
+        else endB = seat.at;
+        spec.seat = "hinge";
+        spec.setback = hingeSetback(throughTrade(node, project));
+        spec.approx = true;
+        noteSeat(node, seat.delta, seat.stuck, railName, "adjustable hinge");
+        const other = end === "a" ? endB : endA;
+        const here = end === "a" ? endA : endB;
+        const dir = norm(sub(other, here));
+        const through = throughTrade(node, project);
         const pipes = [through, link.trade ?? project.trade];
         const joint = largerTrade(pipes);
         noteOneOnHalf(issues, joint, pipes);
         fittings.push({
           id: `hinge:${link.id}:${end}`,
           sku: "hinge",
-          position: [node.x, ny, node.z],
+          position: here,
           axis: throughAxis(node, byId, project.links),
-          branches: [{ dir, setback: linkFam.braceSetback, outer: linkFam.T.outer, inner: linkFam.T.inner }],
+          branches: [{ dir, setback: spec.setback, outer: linkFam.T.outer, inner: linkFam.T.inner }],
           purchasable: CONNECTOR_MAP.hinge.trades.includes(joint),
           approx: true,
           trade: joint,
@@ -1825,7 +1946,10 @@ function buildSketch(project: FullProject): Build {
         });
       }
     }
-    const span3 = Math.hypot(run, yb - ya);
+    const span3 = Math.hypot(endB[0] - endA[0], endB[1] - endA[1], endB[2] - endA[2]);
+    const runNow = Math.hypot(endB[0] - endA[0], endB[2] - endA[2]);
+    const riseNow = endB[1] - endA[1];
+    const slopedNow = Math.abs(riseNow) > 1 / 16;
     const metal = span3 - specA.setback - specB.setback;
     if (metal < 0.75) {
       issues.push({
@@ -1842,17 +1966,18 @@ function buildSketch(project: FullProject): Build {
       return ha && hb ? `${ha}–${hb} @ ${formatDecimal(node.height)}` : "rail";
     };
     const braceWord = specA.seat === "45°" && specB.seat === "45°" ? "45° brace" : "Brace";
+    const approx = specA.approx || specB.approx || diagonal.has(link.id);
     rails.push(
       makeMember({
         id: `rail:${link.id}`,
         kind: "rail",
         label: diagonal.has(link.id) && hostedEnd
           ? `${braceWord} ${endCall(a)} to ${endCall(b)}`
-          : sloped
-            ? `Rail ${nameOf.get(a.id)}–${nameOf.get(b.id)} ${formatDecimal(ya)} to ${formatDecimal(yb)}`
-            : `Rail ${nameOf.get(a.id)}–${nameOf.get(b.id)} @ ${formatDecimal(ya)}`,
-        a: [a.x, ya, a.z],
-        b: [b.x, yb, b.z],
+          : slopedNow
+            ? `Rail ${nameOf.get(a.id)}–${nameOf.get(b.id)} ${formatDecimal(endA[1])} to ${formatDecimal(endB[1])}`
+            : `Rail ${nameOf.get(a.id)}–${nameOf.get(b.id)} @ ${formatDecimal(endA[1])}`,
+        a: endA,
+        b: endB,
         setbackA: specA.setback,
         setbackB: specB.setback,
         seatA: specA.seat,
@@ -1861,7 +1986,7 @@ function buildSketch(project: FullProject): Build {
         gap: linkFam.coupleGap,
         approx,
         trade: link.trade,
-        angle: sloped ? (Math.atan2(yb - ya, run) * 180) / Math.PI : null,
+        angle: slopedNow ? (Math.atan2(riseNow, runNow) * 180) / Math.PI : null,
         pastA,
         pastB,
         capA: (tipA && link.capA === true) || (pastA > 0.05 && link.capA === true),
@@ -1969,10 +2094,15 @@ function buildSketch(project: FullProject): Build {
       });
       continue;
     }
-    const sb = family.braceSetback;
+    const sb = plan.sku === "hinge" ? hingeSetback(project.trade) : family.braceSetback;
     const angle = (Math.atan2(plan.y1 - plan.y0, run) * 180) / Math.PI;
-    const pa: Vec3 = [a.x, plan.y0, a.z];
-    const pb: Vec3 = [b.x, plan.y1, b.z];
+    const seatA = angleSeat(a, [a.x, plan.y0, a.z], [b.x, plan.y1, b.z]);
+    const seatB = angleSeat(b, [b.x, plan.y1, b.z], seatA.at);
+    const pa = seatA.at;
+    const pb = seatB.at;
+    const part = plan.sku === "45" ? "45° connector" : "adjustable hinge";
+    noteSeat(a, seatA.delta, seatA.stuck, `brace ${nameOf.get(a.id)}–${nameOf.get(b.id)}`, part);
+    noteSeat(b, seatB.delta, seatB.stuck, `brace ${nameOf.get(a.id)}–${nameOf.get(b.id)}`, part);
     braces.push(
       makeMember({
         id: `brace:${link.id}`,
@@ -2013,7 +2143,7 @@ function buildSketch(project: FullProject): Build {
   if (braces.length) {
     issues.push({
       severity: "info",
-      text: "Brace lengths are estimates. MakerPipe's cut chart doesn't publish 45° or hinge setbacks, so these use the T-branch setback. Rough-cut, then slide the clamp.",
+      text: "45° brace lengths are estimates. MakerPipe never published that setback. An adjustable hinge is measured: the pipe ends in the longer end clamp, not at a T.",
     });
   }
 
@@ -2360,7 +2490,7 @@ export function buildProject(project: Project): Build {
     if (used45 || usedHinge) {
       issues.push({
         severity: "info",
-        text: "Brace lengths are estimates. MakerPipe's cut chart doesn't publish 45° or hinge setbacks, so these use the T-branch setback. Rough-cut, then slide the clamp.",
+        text: "45° brace lengths are estimates. MakerPipe never published that setback. An adjustable hinge is measured: the pipe ends in the longer end clamp, not at a T.",
       });
     }
     if (usedHinge && !used45) {
@@ -2445,11 +2575,15 @@ function resolveStraps(raw: Strap[] | undefined, members: Member[]): Strap[] {
   return out;
 }
 
-/** Where a hinge may sit. A barrel is 4" tall, so it needs room on both sides. */
+/** Where a hinge may sit. Same clearance past the fitting at both ends, so either end of a rail can take a door. */
 export function hingeWindow(member: Member, kind: HingeKind): [number, number] {
-  const pad = kind === "barrel" ? BARREL_LENGTH / 2 + 0.25 : 1;
-  const lo = Math.min(Math.max(pad, member.setbackA + 0.35), Math.max(pad, member.span / 2));
-  const hi = Math.max(lo, member.span - Math.max(member.setbackB, 0) - pad);
+  const pad = kind === "barrel" ? BARREL_LENGTH / 2 + 0.25 : 0.75;
+  const lo = Math.max(0, member.setbackA) + pad;
+  const hi = member.span - Math.max(member.setbackB, 0) - pad;
+  if (!(hi > lo + 0.5)) {
+    const mid = Math.round((member.span / 2) * 32) / 32;
+    return [mid, mid];
+  }
   return [Math.round(lo * 32) / 32, Math.round(hi * 32) / 32];
 }
 
@@ -2470,13 +2604,78 @@ export type DoorFrame = {
   width: number;
 };
 
-/** Closed door rectangle hung beside an upright post. Null when the pipe is not upright or the hinges cannot hold a door. */
+function memberPoint(member: Member, at: number): Vec3 {
+  const span = vlen(sub(member.b, member.a)) || 1;
+  const t = Math.min(1, Math.max(0, at / span));
+  return [
+    member.a[0] + (member.b[0] - member.a[0]) * t,
+    member.a[1] + (member.b[1] - member.a[1]) * t,
+    member.a[2] + (member.b[2] - member.a[2]) * t,
+  ];
+}
+
+/** Closed door rectangle. On a post it stands beside the post. On a rail it hangs straight down across that end. */
+function railDoor(member: Member, usable: Hinge[], widthIn: number, span: number): DoorFrame | null {
+  const side = usable[0].side === -1 ? -1 : 1;
+  const ats = usable.map((hinge) => hinge.at).sort((a, b) => a - b);
+  const avg = ats.reduce((sum, at) => sum + at, 0) / ats.length;
+  const fromA = avg < span / 2;
+  const origin = fromA ? member.a : member.b;
+  const toward = fromA ? member.b : member.a;
+  let dirX = toward[0] - origin[0];
+  let dirZ = toward[2] - origin[2];
+  if (dirX * dirX + dirZ * dirZ < 0.25) return null;
+  if (Math.abs(dirX) >= Math.abs(dirZ)) {
+    dirX = dirX >= 0 ? 1 : -1;
+    dirZ = 0;
+  } else {
+    dirX = 0;
+    dirZ = dirZ >= 0 ? 1 : -1;
+  }
+  const faceX = -dirZ * side;
+  const faceZ = dirX * side;
+  const knuckle = usable[0].kind === "barrel" ? 0.85 : 1.55;
+  const width = Math.round(Math.min(96, Math.max(8, widthIn)) * 32) / 32;
+  const hx = Math.round((origin[0] + faceX * knuckle) * 32) / 32;
+  const hz = Math.round((origin[2] + faceZ * knuckle) * 32) / 32;
+  const lx = Math.round((hx + dirX * width) * 32) / 32;
+  const lz = Math.round((hz + dirZ * width) * 32) / 32;
+  const ys = usable.map((hinge) => memberPoint(member, hinge.at)[1]);
+  const yLo = Math.min(...ys);
+  const yHi = Math.max(...ys);
+  let bottom: number;
+  let top: number;
+  if (yHi - yLo >= 8) {
+    bottom = yLo;
+    top = yHi;
+  } else {
+    top = yHi;
+    bottom = Math.max(2, top - 28);
+  }
+  if (top - bottom < 8) return null;
+  const base = Math.round(Math.max(0.75, bottom - 1.5) * 32) / 32;
+  const height = Math.round((top + 1.5) * 32) / 32;
+  if (height - base < 8) return null;
+  const actual = Math.hypot(lx - hx, lz - hz);
+  if (actual < 6) return null;
+  return {
+    hinge: { x: hx, z: hz, base, height },
+    latch: { x: lx, z: lz, base, height },
+    bottom: Math.round(bottom * 32) / 32,
+    top: Math.round(top * 32) / 32,
+    dirX,
+    dirZ,
+    width: Math.round(actual * 32) / 32,
+  };
+}
+
 export function doorFrame(member: Member, hinges: Hinge[], widthIn: number): DoorFrame | null {
   const usable = hinges.filter((hinge) => hinge.memberId === member.id && hinge.kind !== "angle");
-  if (!usable.length || member.kind !== "post") return null;
+  if (!usable.length || (member.kind !== "post" && member.kind !== "rail")) return null;
   const axis = sub(member.b, member.a);
   const span = vlen(axis) || 1;
   const up = norm(axis);
+  if (member.kind === "rail") return railDoor(member, usable, widthIn, span);
   if (up[1] < 0.92) return null;
   const side = usable[0].side === -1 ? -1 : 1;
   let faceX = -axis[2];
@@ -3316,7 +3515,7 @@ export function reportText(project: Project, build: Build, unit: "in" | "ft"): s
   lines.push("");
   lines.push("Cuts for T, 90°, 180°, 4-way, 5-way, and couplings follow MakerPipe's conduit length calculator.");
   lines.push("A rail cut is the tube after each end seats in the clamp. The center-to-center length is longer than the piece you cut. Posts run through, so clamps do not shorten them.");
-  lines.push("Brace cuts are estimates. This planner is not affiliated with MakerPipe.");
+  lines.push("An adjustable hinge is two pieces: a 1.3\" puzzle piece on the post and a longer end clamp on the pipe. It sits on its own spot, not on a T or a 90. 45° brace cuts are still estimates.");
   return lines.join("\n");
 }
 
@@ -4334,8 +4533,10 @@ export function selfCheck(): void {
     levels: [],
   });
   if (diag.rails[0]?.approx !== true) throw new Error("diagonal rail should be approximate");
-  if (Math.abs((diag.rails[0]?.pieces[0] ?? 0) - 47.5) > 1e-6) throw new Error(`diagonal cut ${diag.rails[0]?.pieces[0]}`);
+  const hingeCut = 50 - 2 * hingeSetback("three-quarter");
+  if (Math.abs((diag.rails[0]?.pieces[0] ?? 0) - hingeCut) > 1e-6) throw new Error(`diagonal cut ${diag.rails[0]?.pieces[0]}`);
   if ((diag.bom.find((b) => b.sku === "hinge")?.qty ?? 0) !== 2) throw new Error("diagonal should be two hinges");
+  if (diag.rails[0] && Math.abs(diag.rails[0].a[1] - 30) > 1e-6) throw new Error("a lone diagonal should stay where it was drawn");
 
   const slope = buildProject({
     ...base,
@@ -4350,9 +4551,37 @@ export function selfCheck(): void {
     levels: [],
   });
   const sloped = slope.rails[0];
-  const expect = Math.hypot(48, 24) - 2.5;
+  const expect = Math.hypot(48, 24) - 2 * hingeSetback("three-quarter");
   if (!sloped?.approx || Math.abs((sloped.pieces[0] ?? 0) - expect) > 1e-6) throw new Error(`slope cut ${sloped?.pieces[0]}`);
   if ((slope.bom.find((b) => b.sku === "hinge")?.qty ?? 0) !== 2) throw new Error("sloped rail should be two hinges");
+
+  const shed = buildProject({
+    ...base,
+    mode: "sketch",
+    trade: "one",
+    nodes: [
+      { id: "a", x: 0, z: 0, height: 40, flange: false },
+      { id: "b", x: 34, z: 0, height: 40, flange: false },
+      { id: "c", x: 0, z: 38, height: 34, flange: false },
+    ],
+    links: [
+      { id: "ab", a: "a", b: "b", y: 34, kind: "rail" },
+      { id: "slope", a: "a", b: "c", y: 34, yB: 28, kind: "rail" },
+    ],
+    baysX: [],
+    baysZ: [],
+    levels: [],
+  });
+  const cornerClamp = shed.fittings.find((fitting) => fitting.id.startsWith("fit:a:"));
+  const hingeA = shed.fittings.find((fitting) => fitting.id === "hinge:slope:a");
+  const hingeC = shed.fittings.find((fitting) => fitting.id === "hinge:slope:b");
+  const shedRail = shed.rails.find((rail) => rail.id === "rail:slope");
+  if (!cornerClamp || !hingeA || !hingeC || !shedRail) throw new Error("shed slope missing a clamp");
+  if (Math.abs(hingeA.position[1] - cornerClamp.position[1]) < 2.25 - 1e-3) throw new Error(`hinge stacked on the corner ${hingeA.position[1]}`);
+  if (!(hingeA.position[1] < cornerClamp.position[1])) throw new Error("high-end hinge should drop below the corner clamp");
+  if (Math.abs(hingeC.position[1] - 28) > 1e-6) throw new Error(`open end should stay put ${hingeC.position[1]}`);
+  if (Math.abs(shedRail.setbackA - hingeSetback("one")) > 1e-6) throw new Error(`1 inch hinge setback ${shedRail.setbackA}`);
+  if (Math.abs(shedRail.a[1] - hingeA.position[1]) > 1e-6) throw new Error("slope pipe should meet the hinge, not the corner");
 
   const forty = buildProject({
     ...base,
@@ -4897,7 +5126,7 @@ export function selfCheck(): void {
         { id: "h2", memberId: "post:a", kind: "leaf", at: 28, side: 1 },
       ], 32)
     : null;
-  if (!frame || Math.abs(frame.width - 32) > 0.05 || frame.dirZ !== 1) throw new Error(`door frame ${frame?.width} ${frame?.dirZ}`);
+  if (!host || !frame || Math.abs(frame.width - 32) > 0.05 || frame.dirZ !== 1) throw new Error(`door frame ${frame?.width} ${frame?.dirZ}`);
   const gateProject: Project = {
     ...hungProject,
     nodes: [
@@ -4941,4 +5170,51 @@ export function selfCheck(): void {
   if (Math.abs(openLatch.metal - closedLatch.metal) > 0.01) throw new Error("swing changed a cut");
   if (Math.hypot(openLatch.a[0] - closedLatch.a[0], openLatch.a[2] - closedLatch.a[2]) < 1) throw new Error("latch stile should swing");
   if (Math.hypot(openHinge.a[0] - closedHinge.a[0], openHinge.a[2] - closedHinge.a[2]) > 0.2) throw new Error("hinge stile should stay on the knuckle");
+
+  const [winLo, winHi] = hingeWindow({ ...host, span: 40, setbackA: 1.75, setbackB: 1.75 }, "leaf");
+  if (Math.abs(40 - winHi - winLo) > 0.02) throw new Error(`hinge window not symmetric ${winLo} ${winHi}`);
+  const [barrelLo, barrelHi] = hingeWindow({ ...host, span: 40, setbackA: 1.75, setbackB: 1.75 }, "barrel");
+  if (Math.abs(40 - barrelHi - barrelLo) > 0.02) throw new Error(`barrel window not symmetric ${barrelLo} ${barrelHi}`);
+
+  const slopeSpan = Math.hypot(24, 30);
+  const slopeRail: Member = {
+    ...host,
+    id: "rail:slope",
+    kind: "rail",
+    a: [0, 8, 0] as Vec3,
+    b: [0, 32, 30] as Vec3,
+    span: slopeSpan,
+  };
+  const slopeFrame = doorFrame(
+    slopeRail,
+    [
+      { id: "s1", memberId: "rail:slope", kind: "leaf", at: 3, side: 1 },
+      { id: "s2", memberId: "rail:slope", kind: "leaf", at: slopeSpan - 3, side: 1 },
+    ],
+    30,
+  );
+  if (!slopeFrame) throw new Error("sloped rail should hang a door");
+  if (slopeFrame.dirX !== 0 || Math.abs(slopeFrame.dirZ) !== 1) throw new Error(`slope door dir ${slopeFrame.dirX},${slopeFrame.dirZ}`);
+  if (Math.abs(slopeFrame.hinge.base - slopeFrame.latch.base) > 0.02 || Math.abs(slopeFrame.hinge.height - slopeFrame.latch.height) > 0.02) {
+    throw new Error("a rail door should hang plumb");
+  }
+  const yNear = 8 + (24 * 3) / slopeSpan;
+  const yFar = 8 + (24 * (slopeSpan - 3)) / slopeSpan;
+  if (Math.abs(slopeFrame.bottom - Math.min(yNear, yFar)) > 0.05) throw new Error(`slope bottom ${slopeFrame.bottom}`);
+  if (Math.abs(slopeFrame.top - Math.max(yNear, yFar)) > 0.05) throw new Error(`slope top ${slopeFrame.top}`);
+
+  const levelRail: Member = { ...slopeRail, id: "rail:level", a: [0, 34, 0] as Vec3, b: [36, 34, 0] as Vec3, span: 36 };
+  const levelFrame = doorFrame(
+    levelRail,
+    [
+      { id: "l1", memberId: "rail:level", kind: "leaf", at: 4, side: 1 },
+      { id: "l2", memberId: "rail:level", kind: "leaf", at: 20, side: 1 },
+    ],
+    30,
+  );
+  if (!levelFrame || levelFrame.dirX !== 1 || Math.abs(levelFrame.top - 34) > 0.05 || Math.abs(levelFrame.bottom - 6) > 0.05) {
+    throw new Error(`level rail should hang down ${levelFrame?.top} ${levelFrame?.bottom} dir ${levelFrame?.dirX}`);
+  }
+  const leanPost: Member = { ...host, a: [0, 0, 0] as Vec3, b: [20, 10, 0] as Vec3 };
+  if (doorFrame(leanPost, [{ id: "x", memberId: host.id, kind: "leaf", at: 5, side: 1 }], 32)) throw new Error("a leaning post is not a door");
 }

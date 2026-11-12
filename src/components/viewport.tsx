@@ -2,9 +2,9 @@ import { Grid, Html, Line, OrbitControls } from "@react-three/drei";
 import { Canvas, useThree, type ThreeEvent } from "@react-three/fiber";
 import { useEffect, useMemo, useRef, useState, type MutableRefObject } from "react";
 import * as THREE from "three";
-import type { Branch, Build, Fitting, FullProject, Hinge, HingeSwing, MeasureRef, Member, Project, Segment, Strap, Vec3 } from "@/lib/build";
-import { endHeights, fortyFiveButtons, normalizeProject, poseSwung, sheetIndex, snapSketch, squareFrom } from "@/lib/build";
-import { tradeById } from "@/lib/catalog";
+import type { Branch, Build, DoorFrame, Fitting, FullProject, Hinge, HingeSwing, MeasureRef, Member, Project, Segment, Strap, Vec3 } from "@/lib/build";
+import { doorFrame, endHeights, fortyFiveButtons, normalizeProject, poseSwung, sheetIndex, snapSketch, squareFrom } from "@/lib/build";
+import { HINGE_BODY, HINGE_PAST_PIN, HINGE_SLEEVE, tradeById } from "@/lib/catalog";
 import { formatLen } from "@/lib/format";
 import { boardLook, canPlaceLumber, layoutBoard, strapPoints, STOCK_MAP, WOOD_SKUS, type Board, type LayoutContext, type SlideAxis } from "@/lib/lumber";
 import { axisAllowed, MOVE_AXES, type MoveAxis, type MoveTarget } from "@/lib/move";
@@ -333,7 +333,7 @@ function FittingMesh({
   const collarR = angled ? r + 0.14 : r + 0.2;
   const socket = r + 0.16;
   const collarH =
-    fitting.sku === "hinge" ? Math.max(0.68, socket * 1.2)
+    fitting.sku === "hinge" ? HINGE_BODY
     : fitting.sku === "45" ? Math.max(0.74, socket * 1.25)
     : fitting.sku === "T" ? Math.max(0.92, socket * 1.6)
     : fitting.sku === "4way" || fitting.sku === "5way" ? Math.max(1.2, socket * 2.05)
@@ -352,7 +352,7 @@ function FittingMesh({
           <Band key={i} axis={axis} radius={r + 0.18} length={Math.max(1.15, od + 0.35)} look={mat} />
         ))
       ) : fitting.sku === "hinge" && branch ? (
-        <Hinge through={through} branch={branch} collarR={collarR} collarH={collarH} socket={socket} bolt={colors.bolt} look={mat} />
+        <Hinge through={through} branch={branch} collarR={collarR} socket={socket} bolt={colors.bolt} look={mat} />
       ) : (
         <>
           <Band axis={through} radius={collarR} length={collarH} look={mat} />
@@ -369,7 +369,6 @@ function Hinge({
   through,
   branch,
   collarR,
-  collarH,
   socket,
   bolt,
   look,
@@ -377,26 +376,25 @@ function Hinge({
   through: Vec3;
   branch: Branch;
   collarR: number;
-  collarH: number;
   socket: number;
   bolt: string;
   look: ClampLook;
 }) {
   const side = sideOf(through, branch.dir);
-  const pivot = Math.max(collarR + 0.16, 0.7);
-  const cupStart = pivot + 0.22;
-  const cupEnd = Math.max(cupStart + 0.7, branch.setback + 0.2);
+  const pin = Math.max(HINGE_BODY / 2 + 0.15, branch.setback - HINGE_PAST_PIN);
+  const cupStart = pin + 0.16;
+  const cupEnd = Math.max(cupStart + 0.8, branch.setback + HINGE_SLEEVE);
   const cupMid = (cupStart + cupEnd) / 2;
   const cupAt = along(branch.dir, cupMid);
   return (
     <group>
-      <Band axis={through} radius={collarR} length={collarH} look={look} />
-      <mesh position={along(branch.dir, pivot)} quaternion={quatFrom(side)} castShadow>
-        <cylinderGeometry args={[0.2, 0.2, 0.42, 12]} />
+      <Band axis={through} radius={collarR} length={HINGE_BODY} look={look} />
+      <mesh position={along(branch.dir, pin)} quaternion={quatFrom(side)} castShadow>
+        <cylinderGeometry args={[0.18, 0.18, 0.55, 12]} />
         <ClampMat {...look} />
       </mesh>
-      <mesh position={along(branch.dir, pivot)} quaternion={quatFrom(side)} castShadow>
-        <cylinderGeometry args={[0.09, 0.09, 0.56, 8]} />
+      <mesh position={along(branch.dir, pin)} quaternion={quatFrom(side)} castShadow>
+        <cylinderGeometry args={[0.08, 0.08, 0.72, 8]} />
         <meshStandardMaterial color={bolt} metalness={0.9} roughness={0.28} />
       </mesh>
       <mesh position={cupAt} quaternion={quatFrom(branch.dir)} castShadow>
@@ -412,7 +410,7 @@ function Hinge({
         quaternion={quatFrom(side)}
         castShadow
       >
-        <cylinderGeometry args={[0.09, 0.09, 0.12, 6]} />
+        <cylinderGeometry args={[0.09, 0.09, 0.16, 6]} />
         <meshStandardMaterial color={bolt} metalness={0.9} roughness={0.28} />
       </mesh>
     </group>
@@ -1370,6 +1368,9 @@ function GateLeaf({
   const pivot = pivotAt.clone().add(face.clone().multiplyScalar(offset));
   const doorH = Math.max(18, Math.max(...ats) - Math.min(...ats) + 12);
   const doorW = 28;
+  const plan = Math.hypot(member.b[0] - member.a[0], member.b[2] - member.a[2]);
+  const previewWidth = member.kind === "rail" ? Math.min(96, Math.max(8, plan || 28)) : 28;
+  const hung = showGate ? doorFrame(member, hinges, previewWidth) : null;
   const stile = kind === "barrel" ? 1.55 : 0.85;
   const leaf = hot || pick ? "#e2a322" : kind === "leaf" ? "#2c2e31" : "#d5d8d4";
   const pipe = "#b7bdb8";
@@ -1379,6 +1380,7 @@ function GateLeaf({
     onPick();
   };
   return (
+    <>
     <group position={pivot} quaternion={quat} onClick={pickAt}>
       {hinges.map((hinge) => {
         const y = hinge.at - mid;
@@ -1427,7 +1429,7 @@ function GateLeaf({
           <meshBasicMaterial transparent opacity={0} depthWrite={false} />
         </mesh>
       ) : null}
-      {showGate ? (
+      {showGate && !hung ? (
       <group rotation={[0, (deg * Math.PI) / 180, 0]} onClick={pickAt}>
         {kind === "leaf"
           ? hinges.map((hinge) => (
@@ -1459,6 +1461,47 @@ function GateLeaf({
         </mesh>
       </group>
       ) : null}
+    </group>
+    {hung ? <PlumbGate frame={hung} deg={deg} /> : null}
+    </>
+  );
+}
+
+function PlumbGate({ frame, deg }: { frame: DoorFrame; deg: number }) {
+  const dx = frame.latch.x - frame.hinge.x;
+  const dz = frame.latch.z - frame.hinge.z;
+  const stileH = Math.max(1, frame.hinge.height - frame.hinge.base);
+  const stileY = (frame.hinge.base + frame.hinge.height) / 2;
+  const alongX = Math.abs(dx) >= Math.abs(dz);
+  const span = Math.max(1, Math.hypot(dx, dz));
+  const railDir = new THREE.Vector3(dx, 0, dz);
+  if (railDir.lengthSq() < 1e-6) railDir.set(0, 0, 1);
+  const railQuat = new THREE.Quaternion().setFromUnitVectors(UP, railDir.normalize());
+  const pipe = "#b7bdb8";
+  const midY = (frame.bottom + frame.top) / 2;
+  const panelH = Math.max(1, frame.top - frame.bottom);
+  return (
+    <group position={[frame.hinge.x, 0, frame.hinge.z]} rotation={[0, (deg * Math.PI) / 180, 0]}>
+      <mesh position={[0, stileY, 0]} castShadow>
+        <cylinderGeometry args={[0.38, 0.38, stileH, 12]} />
+        <meshStandardMaterial color={pipe} metalness={0.55} roughness={0.38} />
+      </mesh>
+      <mesh position={[dx, stileY, dz]} castShadow>
+        <cylinderGeometry args={[0.38, 0.38, stileH, 12]} />
+        <meshStandardMaterial color={pipe} metalness={0.55} roughness={0.38} />
+      </mesh>
+      <mesh position={[dx / 2, frame.top, dz / 2]} quaternion={railQuat} castShadow>
+        <cylinderGeometry args={[0.32, 0.32, span, 12]} />
+        <meshStandardMaterial color={pipe} metalness={0.55} roughness={0.38} />
+      </mesh>
+      <mesh position={[dx / 2, frame.bottom, dz / 2]} quaternion={railQuat} castShadow>
+        <cylinderGeometry args={[0.32, 0.32, span, 12]} />
+        <meshStandardMaterial color={pipe} metalness={0.55} roughness={0.38} />
+      </mesh>
+      <mesh position={[dx / 2, midY, dz / 2]}>
+        <boxGeometry args={alongX ? [span, panelH, 0.08] : [0.08, panelH, span]} />
+        <meshStandardMaterial color="#efe6d6" transparent opacity={0.28} depthWrite={false} />
+      </mesh>
     </group>
   );
 }

@@ -91,8 +91,8 @@ export type FamilySpec = {
   corner: ArmSpec;
   inline: ArmSpec;
   coupleGap: number;
-  /** Approximate terminating-arm setback for 45° and adjustable hinges.
-   * MakerPipe's calculator does not publish these. */
+  /** Fixed 45° only. MakerPipe's calculator never published it.
+   *  The 3/4" CAD stop is about 1.67"; this stays the chart's T-branch stand-in. */
   braceSetback: number;
 };
 
@@ -202,7 +202,7 @@ export const CONNECTORS: ConnectorInfo[] = [
     joint: "Through pipe + one pipe at any angle to 90°",
     onePrice: 9.49,
     detail:
-      "Locks at the angle you need, or stays loose as a hinge. Used here when a bay is too long for a 45° inside the post height.",
+      "Two different halves. The short puzzle piece grips the through pipe. The longer end clamp stops the other pipe. They hinge up to 90° either way, and they cannot share a spot with a T or a 90.",
   },
   {
     sku: "flange",
@@ -283,6 +283,29 @@ export const ANGLE_HINGE_PRICE: Record<TradeId, number> = {
   "three-quarter": 7.49,
   one: 9.49,
 };
+
+/**
+ * Adjustable angle connector, from MakerPipe's 3/4" dimension sheet.
+ * Puzzle piece is 1.3" along the through pipe. The pin is 1.15" off that
+ * pipe's center (4.36" overall, minus 2.65" from the pin to the open end,
+ * minus half of the 1.12" body). The other pipe stops where the end-clamp
+ * sleeve starts, 0.70" past the pin. 1/2" uses this 3/4" fitting plus shims.
+ * 1" keeps the same gaps; the pin sits out by the extra pipe radius.
+ */
+export const HINGE_BODY = 1.3;
+export const HINGE_PIN = 1.15;
+export const HINGE_PAST_PIN = 0.7;
+/** End clamp, from the pipe stop to the open end. */
+export const HINGE_SLEEVE = 1.95;
+/** Other clamps on the same pipe stay at least this far, center to center. */
+export const CLAMP_CENTERS = 2.25;
+
+export function hingeSetback(trade: TradeId): number {
+  const native = trade === "half" ? "three-quarter" : trade;
+  const od = tradeById(native).od;
+  const base = tradeById("three-quarter").od;
+  return HINGE_PIN + (od - base) / 2 + HINGE_PAST_PIN;
+}
 
 const SKU_SHORT: Record<Sku, string> = {
   T: "T",

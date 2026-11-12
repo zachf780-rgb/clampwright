@@ -354,6 +354,20 @@ function current(get: () => State): Project | undefined {
   return get().projects.find((p) => p.id === get().activeId);
 }
 
+function pipeEnds(project: FullProject, memberId: string): Set<string> {
+  const skip = new Set<string>();
+  if (memberId.startsWith("post:")) skip.add(memberId.slice(5).replace(/:hi$/, ""));
+  if (memberId.startsWith("rail:") || memberId.startsWith("brace:")) {
+    const linkId = memberId.slice(memberId.indexOf(":") + 1).replace(/:stub[AB]$/, "");
+    const link = project.links.find((item) => item.id === linkId);
+    if (link) {
+      skip.add(link.a);
+      skip.add(link.b);
+    }
+  }
+  return skip;
+}
+
 function shiftDoor(project: FullProject, memberId: string, vertical: boolean): FullProject {
   const door = project.doors.find((item) => item.memberId === memberId);
   if (!door) return project;
@@ -362,11 +376,11 @@ function shiftDoor(project: FullProject, memberId: string, vertical: boolean): F
   if (!member) return project;
   const frame = doorFrame(member, hinges, door.width);
   if (!frame) return project;
-  const hostId = memberId.startsWith("post:") ? memberId.slice(5).replace(/:hi$/, "") : "";
+  const skip = pipeEnds(project, memberId);
   const blocked = (x: number, z: number, near: number) =>
     project.nodes.some(
       (node) =>
-        node.id !== hostId &&
+        !skip.has(node.id) &&
         node.id !== door.hingeNode &&
         node.id !== door.latchNode &&
         !node.host &&
@@ -776,17 +790,17 @@ export const useShop = create<State>()(
         const member = built.members.find((item) => item.id === memberId);
         const hinges = project.hinges.filter((hinge) => hinge.memberId === memberId);
         if (!member || hinges.some((hinge) => hinge.kind === "angle") || !hinges.length) {
-          set({ doorNote: hinges.some((hinge) => hinge.kind === "angle") ? "An angle hinge folds a pipe. A door needs offset or barrel hinges." : "Add offset or barrel hinges on an upright post first." });
+          set({ doorNote: hinges.some((hinge) => hinge.kind === "angle") ? "An angle hinge folds a pipe. A door needs offset or barrel hinges." : "Add offset or barrel hinges on an upright post or a rail first." });
           return;
         }
         const frame = doorFrame(member, hinges, width);
         if (!frame) {
-          set({ doorNote: "A door hangs on hinges on an upright post." });
+          set({ doorNote: "A door hangs straight down from offset or barrel hinges. On a post, use an upright one." });
           return;
         }
-        const hostId = memberId.startsWith("post:") ? memberId.slice(5).replace(/:hi$/, "") : "";
+        const skip = pipeEnds(project, memberId);
         const blocked = (x: number, z: number, near: number) =>
-          project.nodes.some((node) => node.id !== hostId && !node.host && Math.hypot(node.x - x, node.z - z) < near);
+          project.nodes.some((node) => !skip.has(node.id) && !node.host && Math.hypot(node.x - x, node.z - z) < near);
         if (blocked(frame.hinge.x, frame.hinge.z, 3) || blocked(frame.latch.x, frame.latch.z, 4)) {
           set({ doorNote: "That width lands on another post. Try a different width." });
           return;
@@ -843,8 +857,14 @@ export const useShop = create<State>()(
         if (!hinge) return;
         const x = Math.round((hinge.x + door.dirX * next) * 32) / 32;
         const z = Math.round((hinge.z + door.dirZ * next) * 32) / 32;
+        const skip = pipeEnds(project, door.memberId);
         const blocked = project.nodes.some(
-          (node) => node.id !== door.latchNode && node.id !== door.hingeNode && !node.host && Math.hypot(node.x - x, node.z - z) < 4,
+          (node) =>
+            node.id !== door.latchNode &&
+            node.id !== door.hingeNode &&
+            !skip.has(node.id) &&
+            !node.host &&
+            Math.hypot(node.x - x, node.z - z) < 4,
         );
         if (blocked) {
           set({ doorNote: "That width lands on another post." });
